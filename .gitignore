@@ -2,6 +2,11 @@
 __pycache__/
 *.py[codz]
 *$py.class
+debug/
+.vscode/
+logs/
+*.mp4
+results/
 
 # C extensions
 *.so

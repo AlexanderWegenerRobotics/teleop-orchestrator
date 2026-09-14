@@ -1,0 +1,62 @@
+network:
+  host: 127.0.0.1  # sim and orchestrator on the same machine
+
+  avatar:
+    send_port: 7000       # -> avatar's receive_port
+    receive_port: 8000    # <- avatar's send_port
+
+  arm_left:
+    device_id: 1  # wire.DeviceId.LEFT_ARM
+    send_port: 7001
+    receive_port: 8001
+    absolute_send_port: 7011  # matches robot_config_avatar.yaml's arm_left.transmission_absolute.receive_port
+
+  arm_right:
+    device_id: 2  # wire.DeviceId.RIGHT_ARM
+    send_port: 7002
+    receive_port: 8002
+    absolute_send_port: 7012  # matches robot_config_avatar.yaml's arm_right.transmission_absolute.receive_port
+
+  head:
+    send_port: 7003
+    receive_port: 8003
+
+  scene_objects:
+    receive_port: 7200   # matches robot_config_local.yaml's avatar.scene_objects.port
+
+  gaze:
+    receive_port: 7300   # orchestrator-only; point the UE5/HTC Vive Pro Eye bridge here
+
+  cameras:
+    wrist_cam_left: avatar_wrist_cam_left
+    wrist_cam_right: avatar_wrist_cam_right
+    head_cam_left: avatar_cam_left
+
+geometry:
+  head_position: [0.0, 0.0, 1.844]      # base_pose.position + link offsets (0.08 + 0.06)
+  camera_position: [0.05, 0.0, 0.035]   # head device's camera.position
+  camera_name: head_head_cam_left        # key into camera_params.json, for gaze normalization only (stereo left/"primary" eye)
+  camera_params_path: ../teleop-simulator/logs/camera_params.json
+  n_candidates: 8   # candidate slot capacity; matches training-time padding (episode_to_hdf5.py)
+  head_look_down_offset: {pan: 0.0, tilt: -0.6}
+
+modules:
+  intent:
+    enabled: false
+    family: hmm          # hmm | gru | transformer -- picks teleop_intent.models.<family>
+    checkpoint: ../teleop-intent/checkpoints/hmm/v12.npz
+
+  policy:
+    enabled: true
+    checkpoint: ../teleop-policy/checkpoints/act_sorting_grasp_full/best_grasp.pt  # world-frame proprio/action, sent via ArmChannel.send_absolute_command
+    mode: autonomous      # autonomous | supportive | off -- see SystemArbitrator
+    debug_dump_dir: debug/cam_dump   # e.g. debug/cam_dump, null
+    debug_dump_every: 30
+
+    training_stored_hw:
+      wrist_cam_left:  [120, 160]
+      wrist_cam_right: [120, 160]
+      head_cam_left:   [240, 320]
+
+arbitrator:
+  require_confirmation_for: [autonomous]   # policy modes needing an explicit human confirm before ENGAGED

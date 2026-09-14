@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teleop-orchestrator"
+version = "0.1.0"
+description = "Runtime host that composes intent/policy/assist modules over a SensorFrame stream."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "h5py",
+    "msgpack",
+    "pyyaml",
+    "scipy",
+    "opencv-python",
+    "torch",
+    "torchvision",
+]
+
+[tool.setuptools.packages.find]
+include = ["teleop_orchestrator*"]

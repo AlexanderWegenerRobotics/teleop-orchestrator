@@ -13,13 +13,12 @@ NULL_TARGET = -1
 class Phase:
     """Intended-action classes (what the operator is trying to do, not observed state)."""
     IDLE = 0
-    UNDECIDED = 1
-    APPROACH = 2
-    GRASP = 3
-    TRANSPORT = 4
-    PLACE = 5
-    N_CLASSES = 6
-    NAMES = {0: "idle", 1: "undecided", 2: "approach", 3: "grasp", 4: "transport", 5: "place"}
+    APPROACH = 1
+    GRASP = 2
+    TRANSPORT = 3
+    PLACE = 4
+    N_CLASSES = 5
+    NAMES = {0: "idle", 1: "approach", 2: "grasp", 3: "transport", 4: "place"}
 
 
 def _entropy(p: np.ndarray) -> float:
@@ -44,6 +43,10 @@ class ArmIntent:
     def top_target(self) -> int:
         """Index of the most likely target candidate."""
         return int(np.argmax(self.target_posterior))
+
+    def phase_entropy(self) -> float:
+        """Entropy of the phase posterior."""
+        return _entropy(self.phase_posterior)
 
     def target_entropy(self) -> float:
         """Entropy of the target posterior; the uncertainty signal the nudge gate reads."""
