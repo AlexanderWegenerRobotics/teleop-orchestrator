@@ -32,6 +32,11 @@ class RunLogger:
         # unable to close; keep both so the two are always comparable.
         self._cmd = defaultdict(list)
 
+    @property
+    def n_ticks(self) -> int:
+        """Ticks recorded so far; zero means the source never produced a frame."""
+        return len(self._frame.get("timestamp_ns", []))
+
     def log_gripper(self, side: str, width: float, close_flag: float) -> None:
         """Records the commanded gripper for one arm this tick: the policy's
         raw predicted width and the boolean flag actually transmitted."""

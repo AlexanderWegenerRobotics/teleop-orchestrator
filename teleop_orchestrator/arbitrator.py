@@ -18,6 +18,9 @@ from typing import Callable, Optional
 from .live import wire
 from .live.sys_state_client import SysStateClient
 
+# Modes in which something issues arm commands rather than only observing.
+ACTUATING_MODES = ("autonomous", "playback")
+
 
 class SystemArbitrator:
     """Sequences SysState transitions via SysStateClient, gated by the
@@ -35,8 +38,10 @@ class SystemArbitrator:
 
     @property
     def autonomous_allowed(self) -> bool:
-        """Whether policy is configured to command the arms directly this session."""
-        return self.policy_mode == "autonomous"
+        """Whether a module is configured to command the arms directly this
+        session. 'playback' counts: a recorded trajectory moves the arms just as
+        really as a policy does, so it is gated (and confirmed) the same way."""
+        return self.policy_mode in ACTUATING_MODES
 
     def _confirm_cli(self, mode: str) -> bool:
         """Default confirmation: a blocking terminal prompt. Pass confirm= to

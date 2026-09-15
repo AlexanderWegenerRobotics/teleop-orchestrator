@@ -39,6 +39,7 @@ class ArmChannel:
         self._sock.settimeout(0.1)
 
         self._seq = 0
+        self._malformed = 0
         self._latest: Optional[ArmState] = None
         self._latest_time = 0.0
         self._lock = threading.Lock()
@@ -100,6 +101,14 @@ class ArmChannel:
                 break
             state = wire.unpack_arm_state(data)
             if state is None:
+                # Wrong size = the C++ struct moved under us. Silently dropping
+                # these once cost a full debugging session: every latest()
+                # returns None, so the arm looks merely absent.
+                self._malformed += 1
+                if self._malformed == 1:
+                    print(f"[{self.name}] WARNING: dropping malformed ArmStateMsg -- got {len(data)} bytes, "
+                          f"expected {wire.ARM_STATE_SIZE}. wire.py is out of sync with common.hpp; "
+                          f"commands this channel sends are the wrong size too.")
                 continue
             with self._lock:
                 self._latest = state

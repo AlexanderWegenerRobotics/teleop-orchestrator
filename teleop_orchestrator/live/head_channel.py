@@ -29,6 +29,7 @@ class HeadChannel:
         self._sock.settimeout(0.1)
 
         self._seq = 0
+        self._malformed = 0
         self._latest: Optional[HeadState] = None
         self._latest_time = 0.0
         self._lock = threading.Lock()
@@ -73,6 +74,12 @@ class HeadChannel:
                 break
             state = wire.unpack_head_state(data)
             if state is None:
+                # See arm_channel's matching branch: wrong size means wire.py
+                # and common.hpp have diverged, in both directions at once.
+                self._malformed += 1
+                if self._malformed == 1:
+                    print(f"[head] WARNING: dropping malformed HeadStateMsg -- got {len(data)} bytes, "
+                          f"expected {wire.HEAD_STATE_SIZE}. wire.py is out of sync with common.hpp.")
                 continue
             with self._lock:
                 self._latest = state

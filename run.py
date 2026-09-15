@@ -27,6 +27,7 @@ from teleop_orchestrator.live.sys_state_client import SysStateClient
 from teleop_orchestrator.logging import RunLogger
 from teleop_orchestrator.operator_console import OperatorConsole
 from teleop_orchestrator.orchestrator import Orchestrator
+from teleop_orchestrator.playback_module import PlaybackModule
 from teleop_orchestrator.policy_module import PolicyModule
 
 
@@ -59,13 +60,33 @@ def build_live_channels(net: dict, host: str):
     return sys_state, arm_left, arm_right, head, gaze, objects, cameras
 
 
-def build_modules(cfg: dict, arm_left: ArmChannel, arm_right: ArmChannel) -> dict:
-    """Constructs the enabled intent/policy modules per system.yaml's modules block."""
+def resolve_mode(cfg: dict) -> str:
+    """Resolves the one mode the session runs in, from the policy and playback
+    blocks. Exactly one of them may command the arms: they both emit an
+    ActionOutput and the actuator can only send one pose per arm per tick, so
+    enabling both is a config error rather than something to arbitrate at
+    runtime."""
+    policy, playback = cfg["modules"]["policy"], cfg["modules"].get("playback", {})
+    policy_on = policy["enabled"] and policy["mode"] != "off"
+    if playback.get("enabled") and policy_on:
+        raise ValueError("modules.policy and modules.playback are both enabled -- "
+                         "only one may command the arms; set policy.mode: off or playback.enabled: false")
+    return "playback" if playback.get("enabled") else policy["mode"]
+
+
+def build_modules(cfg: dict, mode: str, arm_left: ArmChannel, arm_right: ArmChannel) -> dict:
+    """Constructs the enabled intent/policy/playback modules per system.yaml's modules block."""
     modules = {}
     mcfg = cfg["modules"]
     if mcfg["intent"]["enabled"]:
         modules["intent"] = build_intent_model(mcfg["intent"]["family"], mcfg["intent"]["checkpoint"])
-    if mcfg["policy"]["enabled"] and mcfg["policy"]["mode"] != "off":
+    if mode == "playback":
+        pbcfg = mcfg["playback"]
+        modules["playback"] = PlaybackModule(pbcfg["episode"], arm_left, arm_right,
+                                              speed=pbcfg.get("speed", 1.0),
+                                              start_ramp_s=pbcfg.get("start_ramp_s", 2.0),
+                                              replay_head=pbcfg.get("replay_head", True))
+    elif mcfg["policy"]["enabled"] and mcfg["policy"]["mode"] != "off":
         # PolicyModule reads its required camera names/order from the
         # checkpoint itself (see policy_module.py) -- system.yaml's
         # network.cameras must have matching keys, but nothing here needs
@@ -87,10 +108,13 @@ _GRIPPER_CLOSE_THRESHOLD_M = 0.04
 
 
 def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right: ArmChannel,
-                   head: HeadChannel, head_look_down_offset: dict, logger=None):
-    """Returns the Orchestrator.run(on_tick=...) callback that sends policy's
-    ActionOutput to the arms -- only when autonomous_allowed, so supportive/off
-    mode never issues an ArmCommandMsg regardless of what policy predicts.
+                   head: HeadChannel, head_look_down_offset: dict, logger=None,
+                   action_key: str = "policy"):
+    """Returns the Orchestrator.run(on_tick=...) callback that sends the acting
+    module's ActionOutput to the arms -- only when autonomous_allowed, so
+    supportive/off mode never issues an ArmCommandMsg regardless of what the
+    module predicts. action_key names that module ("policy" or "playback");
+    everything below this line is identical for both, which is the point.
     Uses send_absolute_command: the retrained checkpoint predicts absolute
     world-frame poses (see teleop-policy/configs/dataset.yaml), which the sim
     only interprets correctly on the absolute channel (worldAbsoluteToBase),
@@ -102,12 +126,17 @@ def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right:
     head_cam_left drifts out-of-distribution over a session unless pinned
     somewhere reasonable. Deterministic/scripted rather than learned --
     see system.yaml's geometry.head_look_down_offset comment for tuning.
+    Playback overrides it per tick with the head track it recorded
+    (extras head_pan/head_tilt), which is strictly better when available.
     """
     def on_tick(frame, outputs) -> None:
-        action = outputs.get("policy")
-        if action is None or not arbitrator.autonomous_allowed:
+        action = outputs.get(action_key)
+        if action is None or not action.ee_pose or not arbitrator.autonomous_allowed:
             return
-        head.send_command(wire.SysState.ENGAGED, head_look_down_offset["pan"], head_look_down_offset["tilt"])
+        extras = action.extras or {}
+        head.send_command(wire.SysState.ENGAGED,
+                           extras.get("head_pan", head_look_down_offset["pan"]),
+                           extras.get("head_tilt", head_look_down_offset["tilt"]))
         for side, channel in (("arm_left", arm_left), ("arm_right", arm_right)):
             if side not in action.ee_pose:
                 continue
@@ -161,13 +190,14 @@ def main(config_path: str = "configs/system.yaml") -> None:
         gaze_intrinsics=gaze_intrinsics, n_candidates=geo["n_candidates"],
     )
 
-    modules = build_modules(cfg, arm_left, arm_right)
-    arbitrator = SystemArbitrator(sys_state, policy_mode=cfg["modules"]["policy"]["mode"], require_confirmation_for=cfg["arbitrator"]["require_confirmation_for"])
+    mode = resolve_mode(cfg)
+    modules = build_modules(cfg, mode, arm_left, arm_right)
+    arbitrator = SystemArbitrator(sys_state, policy_mode=mode, require_confirmation_for=cfg["arbitrator"]["require_confirmation_for"])
 
     console = OperatorConsole(arbitrator, sys_state)
     console.start()
 
-    print(f"[run] modules: {list(modules)}  policy mode: {arbitrator.policy_mode}")
+    print(f"[run] modules: {list(modules)}  mode: {arbitrator.policy_mode}")
     try:
         if not arbitrator.engage():
             print("[run] engage aborted (refused confirmation or timed out) -- exiting without running")
@@ -178,10 +208,29 @@ def main(config_path: str = "configs/system.yaml") -> None:
         # it actually put on the wire (see RunLogger.log_gripper) alongside what
         # the policy predicted.
         run_logger = RunLogger()
-        actuator = make_actuator(arbitrator, arm_left, arm_right, head, geo["head_look_down_offset"], logger=run_logger)
-        logger = orchestrator.run(logger=run_logger, on_tick=actuator, should_stop=console.stop_requested)
+        action_key = "playback" if mode == "playback" else "policy"
+        actuator = make_actuator(arbitrator, arm_left, arm_right, head, geo["head_look_down_offset"],
+                                  logger=run_logger, action_key=action_key)
+        # Playback ends itself when the recording runs out; a policy run only
+        # ever ends on the console or Ctrl+C.
+        playback = modules.get("playback")
+        should_stop = (console.stop_requested if playback is None
+                       else lambda: console.stop_requested() or playback.finished)
+        logger = orchestrator.run(logger=run_logger, on_tick=actuator, should_stop=should_stop)
+        if logger.n_ticks == 0:
+            # LiveSource ticks on SceneObjectsMsg and gives up after a couple of
+            # seconds of silence, so a run that ends here never saw the sim at
+            # all -- and every module is innocent. Say which feed was missing
+            # rather than leaving an empty log to explain it.
+            print(f"[run] WARNING: no frames -- nothing arrived on scene_objects port "
+                  f"{net['scene_objects']['receive_port']} within LiveSource's tick timeout. "
+                  f"Check the avatar's robot_config avatar.scene_objects block is present and "
+                  f"enabled, and that it points at this host/port.")
         log_path = f"logs/run_{time.strftime('%Y%m%d_%H%M%S')}.hdf5"
-        logger.save(log_path, meta={"policy_mode": arbitrator.policy_mode, "config_path": config_path})
+        meta = {"policy_mode": arbitrator.policy_mode, "config_path": config_path}
+        if playback is not None:
+            meta["playback_episode"] = playback.path
+        logger.save(log_path, meta=meta)
         print(f"[run] saved {log_path}")
     except KeyboardInterrupt:
         # Ctrl+C is the emergency-stop path -- same cleanup as a graceful

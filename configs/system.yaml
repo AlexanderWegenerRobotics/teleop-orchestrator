@@ -47,7 +47,7 @@ modules:
     checkpoint: ../teleop-intent/checkpoints/hmm/v12.npz
 
   policy:
-    enabled: true
+    enabled: false
     checkpoint: ../teleop-policy/checkpoints/act_sorting_grasp_full/best_grasp.pt  # world-frame proprio/action, sent via ArmChannel.send_absolute_command
     mode: autonomous      # autonomous | supportive | off -- see SystemArbitrator
     debug_dump_dir: debug/cam_dump   # e.g. debug/cam_dump, null
@@ -58,5 +58,13 @@ modules:
       wrist_cam_right: [120, 160]
       head_cam_left:   [240, 320]
 
+  playback:
+    enabled: true
+    episode: C:/Users/ceti/Documents/05_data/teleop-sorting/avatar/014/episode.hdf5
+    #episode: ../teleop-simulator/logs/021
+    speed: 1.0          # >1 plays faster than recorded; the sim still has to keep up
+    start_ramp_s: 2.0   # blend from the arms' measured pose into the first recorded command
+    replay_head: true   # use the recorded head track instead of geometry.head_look_down_offset
+
 arbitrator:
-  require_confirmation_for: [autonomous]   # policy modes needing an explicit human confirm before ENGAGED
+  require_confirmation_for: [autonomous, playback]   # modes needing an explicit human confirm before ENGAGED

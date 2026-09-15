@@ -93,10 +93,20 @@ def demo_reference(store_root: str, episode: str):
     return out
 
 
+def _action_module(f) -> str:
+    """Which module drove the arms in this run: 'policy', or 'playback' for a
+    recorded-trajectory run (see teleop_orchestrator/playback_module.py)."""
+    for name in ("policy", "playback"):
+        if f"modules/{name}" in f:
+            return name
+    raise KeyError("run log has no policy or playback module output")
+
+
 def rollout_metrics(path: str):
     """Same quantities, measured on a live/sim run log."""
     out = {}
     with h5py.File(path, "r") as f:
+        mod = _action_module(f)
         has_cmd = "commanded" in f
         has_cand = "frames/candidate_world_pos" in f
         if has_cand:
@@ -104,9 +114,9 @@ def rollout_metrics(path: str):
             sel = f["frames/candidate_mask"][:] & (f["frames/candidate_types"][:] == CAND_TYPE_OBJECT)
 
         for arm in ARMS:
-            pred = f[f"modules/policy/{arm}/gripper"][:]
+            pred = f[f"modules/{mod}/{arm}/gripper"][:]
             rec = {
-                "z_cmd_min": float(f[f"modules/policy/{arm}/ee_pose"][:][:, 2].min()),
+                "z_cmd_min": float(f[f"modules/{mod}/{arm}/ee_pose"][:][:, 2].min()),
                 "grip_pred_min": float(pred.min()),
                 "n_attempts": int((np.diff((pred < np.percentile(pred, 90) - 0.005).astype(int)) > 0).sum()),
             }
