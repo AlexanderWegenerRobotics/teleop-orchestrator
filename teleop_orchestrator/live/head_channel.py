@@ -19,9 +19,15 @@ class HeadChannel:
     """The head's UDP command/state channel (robot_config_local.yaml's
     head device transmission block: remote_ip/send_port/receive_port)."""
 
-    def __init__(self, remote_ip: str, send_port: int, receive_port: int, max_staleness_s: float = 0.5):
+    def __init__(self, remote_ip: str, send_port: int, receive_port: int,
+                 max_staleness_s: float = 0.5, absolute_send_port: Optional[int] = None):
         self.remote_ip = remote_ip
         self.send_port = send_port
+        # head_control.cpp's transmission_absolute.receive_port -- a second,
+        # separate command port whose pan/tilt are ABSOLUTE joint targets
+        # instead of send_port's offsets from q0. Optional: only needed for
+        # policy/autonomous actuation, not by anything using send_command.
+        self.absolute_send_port = absolute_send_port
         self._max_staleness_s = max_staleness_s
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -59,10 +65,36 @@ class HeadChannel:
         return state
 
     def send_command(self, sys_state: int, pan: float, tilt: float) -> None:
-        """Sends one HeadCommandMsg target."""
+        """Sends one HeadCommandMsg as an offset from the head's home pose.
+
+        head_control.cpp adds q0 to whatever arrives here. That is the right
+        frame for the VR interface, which sends the operator's head rotation
+        relative to a captured origin -- and the wrong one for a policy, which
+        predicts absolute joint angles. Use send_absolute_command for those.
+        """
         self._seq += 1
         packed = wire.pack_head_command(sequence=self._seq, state=sys_state, pan=pan, tilt=tilt)
         self._sock.sendto(packed, (self.remote_ip, self.send_port))
+
+    def send_absolute_command(self, sys_state: int, pan: float, tilt: float) -> None:
+        """Same HeadCommandMsg, sent to absolute_send_port instead -- the sim
+        reads pan/tilt as absolute joint targets and does not add q0.
+
+        This is the channel for anything trained on head.csv, whose q and q_cmd
+        are absolute. Sending those to send_command applies q0 twice; that cost
+        an evening on 2026-09-23 and looked like a policy that had learned to
+        stare at the table.
+
+        Same UDP socket, different destination port -- no separate bind, since
+        head state is read off this channel's own publish via receive_port.
+        """
+        if self.absolute_send_port is None:
+            raise RuntimeError("head: absolute_send_port not configured -- "
+                               "add transmission_absolute to the head device in "
+                               "robot_config and network.head.absolute_send_port to system.yaml")
+        self._seq += 1
+        packed = wire.pack_head_command(sequence=self._seq, state=sys_state, pan=pan, tilt=tilt)
+        self._sock.sendto(packed, (self.remote_ip, self.absolute_send_port))
 
     def _recv_loop(self) -> None:
         while self._running:

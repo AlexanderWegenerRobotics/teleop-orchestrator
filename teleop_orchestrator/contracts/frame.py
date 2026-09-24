@@ -55,6 +55,36 @@ class SensorFrame:
     gaze_valid: bool = True
     engaged: bool = True                # both arms in a training/active state
 
+    # Which command channel the avatar is letting move each arm this tick, keyed
+    # "arm_left"/"arm_right" (values: live.object_source.AUTHORITY_*). Per arm,
+    # because the operator can take one hand back while the policy keeps the
+    # other -- so this is a dict rather than a scalar, and every consumer has to
+    # decide per arm rather than for the robot as a whole.
+    #
+    # An arm missing from the dict means the avatar did not say, NOT that it is
+    # unclaimed: read it with .get(side, AUTHORITY_UNSET) so an avatar without
+    # the field behaves exactly as it did before authority existed.
+    authority: dict[str, int] = field(default_factory=dict)
+
+    # Measured head pan/tilt this tick, in radians -- the same two joints, in
+    # the same order, as the head's own q vector.
+    #
+    # Carried on the frame for the same reason authority is. The head's UDP
+    # channel is point-to-point on the avatar side, so whenever the VR
+    # interface is running it owns that port and this process's HeadChannel
+    # receives nothing at all; system.yaml says as much next to
+    # network.head.receive_port. LiveSource resolves the two sources once per
+    # tick (channel first, scene publish as fallback) and everything downstream
+    # reads the answer here, rather than repeating that fallback and getting it
+    # wrong -- which PolicyModule did, skipping every tick on a head state that
+    # was never going to arrive.
+    #
+    # 0.0 is a real, reachable pose (neck centred), not a sentinel: an avatar
+    # predating head_pan/head_tilt on SceneObjectsMsg looks exactly like one
+    # looking straight ahead.
+    head_pan: float = 0.0
+    head_tilt: float = 0.0
+
     # Per-arm grasp confirmation (ArmControl::updateGraspConfirmation, real
     # sensor-derived signal, not privileged sim state -- gripper width settled
     # at a value consistent with holding something, while a grasp was

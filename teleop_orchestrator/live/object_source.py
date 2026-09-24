@@ -13,7 +13,7 @@ import socket
 import threading
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import msgpack
@@ -34,6 +34,20 @@ class ObjectSlot:
     half_extents: tuple  # (x, y, z); zeros if unknown/not a box
 
 
+# CommandAuthority (teleop-simulator/include/common.hpp): which channel the
+# avatar is currently letting move an arm. Per arm, because the operator can be
+# correcting one hand while the policy keeps driving the other.
+AUTHORITY_POLICY = 0
+AUTHORITY_HUMAN = 1
+AUTHORITY_HOLD = 2
+# Nobody has claimed that arm, so the avatar is gating nothing -- the behaviour
+# that existed before authority. This is also what an avatar too old to publish
+# the field looks like, which is why it is the default everywhere rather than
+# HOLD: defaulting to HOLD would silently stop every autonomous run against an
+# un-upgraded sim, with no error to explain it.
+AUTHORITY_UNSET = 255
+
+
 @dataclass
 class ObjectFrame:
     """One tick's worth of candidate/bin slots, with the frame_id LiveSource
@@ -41,6 +55,22 @@ class ObjectFrame:
     frame_id: int
     timestamp_ns: int
     slots: list
+    # {"arm_left": int, "arm_right": int}, CommandAuthority per arm. The avatar
+    # re-sends this every tick rather than publishing an event, so a dropped
+    # datagram costs 10 ms of staleness instead of leaving the policy acting on
+    # an authority that was revoked. Empty = the avatar did not say.
+    authority: dict = field(default_factory=dict)
+    # Avatar SysState, carried here so it can be read without the reliable
+    # command channel. That channel is point-to-point on the avatar side, so
+    # with the VR interface also connected it can only serve one client; this
+    # socket has its own host/port and no such contention. 255 = UNDEFINED,
+    # which is also what an avatar predating the field looks like.
+    state: int = 255
+    # Head pan/tilt in radians, carried for the same reason as `state`: the
+    # head's own channel is point-to-point and the VR interface needs it, so
+    # anything that only wants the head POSE takes it from here instead.
+    head_pan: float = 0.0
+    head_tilt: float = 0.0
 
 
 class ObjectSource(ABC):
@@ -124,7 +154,14 @@ class SimObjectSource(ObjectSource):
                 )
                 for s in msg.get("slots", [])
             ]
-            frame = ObjectFrame(frame_id=msg["frame_id"], timestamp_ns=msg["timestamp_ns"], slots=slots)
+            # .get, not [..]: an avatar that predates the authority field is a
+            # perfectly good avatar, it just is not gating anything.
+            authority = {str(k): int(v) for k, v in (msg.get("authority") or {}).items()}
+            frame = ObjectFrame(frame_id=msg["frame_id"], timestamp_ns=msg["timestamp_ns"],
+                                slots=slots, authority=authority,
+                                state=int(msg.get("state", 255)),
+                                head_pan=float(msg.get("head_pan", 0.0)),
+                                head_tilt=float(msg.get("head_tilt", 0.0)))
             with self._lock:
                 self._latest = frame
                 self._latest_time = time.monotonic()

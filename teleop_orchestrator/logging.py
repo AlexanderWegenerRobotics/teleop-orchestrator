@@ -73,6 +73,15 @@ class RunLogger:
         self._frame["engaged"].append(frame.engaged)
         self._frame["gaze_valid"].append(frame.gaze_valid)
         self._frame["usable"].append(frame.usable)
+        # Who held each arm this tick, as the avatar reported it. One series per
+        # arm rather than one for the robot: the two genuinely differ during an
+        # intervention, and a single number could only be right about one.
+        #
+        # This is also the join between this log and the avatar's arm.csv. The
+        # same quantity is recorded on both sides of the link, produced
+        # independently, so the two disagreeing is visible rather than silent.
+        for side in ("arm_left", "arm_right"):
+            self._frame[f"authority_{side}"].append(int((frame.authority or {}).get(side, 255)))
         self._frame["candidate_types"].append(frame.candidate_types)
         self._frame["candidate_mask"].append(frame.candidate_mask)
         # Where the candidates actually were, not just how many there were.

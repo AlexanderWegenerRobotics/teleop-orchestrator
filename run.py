@@ -13,7 +13,7 @@ import time
 
 import yaml
 
-from teleop_orchestrator.arbitrator import SystemArbitrator
+from teleop_orchestrator.arbitrator import INTERVENTION_MODE, SystemArbitrator
 from teleop_orchestrator.intent_factory import build_intent_model
 from teleop_orchestrator.live import wire
 from teleop_orchestrator.live.arm_channel import ArmChannel
@@ -47,7 +47,8 @@ def build_live_channels(net: dict, host: str):
     arm_right = ArmChannel("arm_right", wire.DeviceId.RIGHT_ARM, host,
                             net["arm_right"]["send_port"], net["arm_right"]["receive_port"],
                             absolute_send_port=net["arm_right"].get("absolute_send_port"))
-    head = HeadChannel(host, net["head"]["send_port"], net["head"]["receive_port"])
+    head = HeadChannel(host, net["head"]["send_port"], net["head"]["receive_port"],
+                        absolute_send_port=net["head"].get("absolute_send_port"))
     gaze = GazeReceiver(receive_port=net["gaze"]["receive_port"])
     objects = SimObjectSource(receive_port=net["scene_objects"]["receive_port"])
     cameras = {name: SharedFrameReader(shm_name) for name, shm_name in net["cameras"].items()}
@@ -58,6 +59,17 @@ def build_live_channels(net: dict, host: str):
     for c in (sys_state, arm_left, arm_right, head, gaze, objects):
         c.start()
     return sys_state, arm_left, arm_right, head, gaze, objects, cameras
+
+
+def _scene_snapshot(objects: SimObjectSource):
+    """Most recent SceneObjectsMsg, or None if the feed has not produced one.
+
+    Carries both the avatar's SysState and its per-arm authority. Read from here
+    rather than from SysStateClient because the avatar's reliable command channel
+    is point-to-point: with the VR interface connected it talks to the interface,
+    and this process would see no state at all.
+    """
+    return objects.latest()
 
 
 def resolve_mode(cfg: dict) -> str:
@@ -74,7 +86,8 @@ def resolve_mode(cfg: dict) -> str:
     return "playback" if playback.get("enabled") else policy["mode"]
 
 
-def build_modules(cfg: dict, mode: str, arm_left: ArmChannel, arm_right: ArmChannel) -> dict:
+def build_modules(cfg: dict, mode: str, arm_left: ArmChannel, arm_right: ArmChannel,
+                  head: HeadChannel) -> dict:
     """Constructs the enabled intent/policy/playback modules per system.yaml's modules block."""
     modules = {}
     mcfg = cfg["modules"]
@@ -93,10 +106,17 @@ def build_modules(cfg: dict, mode: str, arm_left: ArmChannel, arm_right: ArmChan
         # to tell it which ones or in what order.
         dbg = mcfg["policy"].get("debug_dump_dir")
         stored = mcfg["policy"].get("training_stored_hw")
-        modules["policy"] = PolicyModule(mcfg["policy"]["checkpoint"], arm_left, arm_right,
+        # head is passed for completeness, not because PolicyModule reads it:
+        # a head-enabled checkpoint needs the measured neck angles in proprio,
+        # and it takes those off SensorFrame, which LiveSource fills from this
+        # channel (now that it has its own port via transmission_absolute) and
+        # from SceneObjectsMsg if that ever goes quiet. Commanding the head
+        # happens in make_actuator's on_tick, off the head_pan/head_tilt extras.
+        modules["policy"] = PolicyModule(mcfg["policy"]["checkpoint"], arm_left, arm_right, head,
                                           debug_dump_dir=dbg,
                                           debug_dump_every=mcfg["policy"].get("debug_dump_every", 30),
-                                          stored_hw=stored)
+                                          stored_hw=stored,
+                                          resume_ramp_s=mcfg["policy"].get("resume_ramp_s", 0.5))
     return modules
 
 
@@ -107,9 +127,31 @@ _GRIPPER_OPEN_WIDTH_M = 0.08
 _GRIPPER_CLOSE_THRESHOLD_M = 0.04
 
 
+def agree_from_spread(spread: float, spread_full: float, spread_zero: float) -> float:
+    """Maps ensemble_spread onto the HUD's AGREE scale: 1 at or below spread_full,
+    0 at or above spread_zero, linear between."""
+    return float(min(1.0, max(0.0, (spread_zero - spread) / (spread_zero - spread_full))))
+
+
+def make_status_sender(sys_state: SysStateClient, status_hz: float, agree_spread: tuple):
+    """Returns a per-tick callback that sends policy_status (INF, AGREE) to the
+    HUD at status_hz, via the avatar."""
+    period = 1.0 / status_hz
+    last = [0.0]
+
+    def send(extras: dict) -> None:
+        now = time.monotonic()
+        if now - last[0] < period or "inference_ms" not in extras:
+            return
+        last[0] = now
+        agree = agree_from_spread(extras.get("ensemble_spread", 0.0), *agree_spread)
+        sys_state.send_policy_status(extras["inference_ms"], agree)
+    return send
+
+
 def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right: ArmChannel,
-                   head: HeadChannel, head_look_down_offset: dict, logger=None,
-                   action_key: str = "policy"):
+                   head: HeadChannel, head_pin_absolute: dict,
+                   logger=None, action_key: str = "policy", status_sender=None):
     """Returns the Orchestrator.run(on_tick=...) callback that sends the acting
     module's ActionOutput to the arms -- only when autonomous_allowed, so
     supportive/off mode never issues an ArmCommandMsg regardless of what the
@@ -125,20 +167,77 @@ def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right:
     gaze down toward the grasp), but nothing here reproduces that, so
     head_cam_left drifts out-of-distribution over a session unless pinned
     somewhere reasonable. Deterministic/scripted rather than learned --
-    see system.yaml's geometry.head_look_down_offset comment for tuning.
+    see system.yaml's geometry.head_pin_absolute comment for tuning.
     Playback overrides it per tick with the head track it recorded
     (extras head_pan/head_tilt), which is strictly better when available.
     """
     def on_tick(frame, outputs) -> None:
         action = outputs.get(action_key)
-        if action is None or not action.ee_pose or not arbitrator.autonomous_allowed:
+        if action is None:
             return
         extras = action.extras or {}
-        head.send_command(wire.SysState.ENGAGED,
-                           extras.get("head_pan", head_look_down_offset["pan"]),
-                           extras.get("head_tilt", head_look_down_offset["tilt"]))
+        # Before the authority check: the HUD keeps showing inference time and
+        # agreement while the operator holds the robot, which is when AGREE matters.
+        if status_sender is not None:
+            status_sender(extras)
+        if not action.ee_pose or not arbitrator.autonomous_allowed:
+            return
+
+        # The head is pinned only while this process is actually driving
+        # something. It is NOT in the policy's action space -- it is pinned so
+        # head_cam_left stays where the training data had it -- but it IS an
+        # observation, so it cannot simply follow the operator either.
+        #
+        # The resolution: whoever holds the arms holds the head. While the
+        # policy drives, the head stays pinned and the policy's view stays in
+        # distribution. The moment the operator has taken every arm, this stops
+        # sending and their head is their own again -- which is exactly when
+        # they need to look around, because they are fixing something.
+        #
+        # There is still no authority ON the head itself -- both processes send
+        # to the same port and the last writer wins -- so "stop sending" remains
+        # the whole handover mechanism. What changed on 2026-09-22 is that the
+        # other side now plays by the same rule: the interface gates
+        # SendHeadCommand on the operator holding authority
+        # (OperatorPawn::IsOperatorHoldingHead), so the two processes are never
+        # both writing. Before that, the operator's HMD was writing over this
+        # pin at 90 Hz whenever their headset moved, which is why the pin
+        # "worked" only while nobody was wearing it.
+        #
+        # extras head_pan/head_tilt are no longer just playback's recorded
+        # track: the retrained policy emits head as real action dims, and this
+        # forwards them unchanged. head_pin_absolute stays as the fallback
+        # for a checkpoint that does not predict head -- a pin is still better
+        # than a head that drifts, and the dict lookup is what tells the two
+        # cases apart without a config flag.
+        held = [s for s in ("arm_left", "arm_right")
+                if s in action.ee_pose and arbitrator.arm_allowed(frame, s)]
+        if held:
+            # One frame everywhere in this process: ABSOLUTE joint targets, on
+            # the head's absolute channel. The policy predicts absolute because
+            # head.csv logs absolute, and head_pin_absolute is configured in the
+            # same frame, so nothing here converts anything.
+            #
+            # The home-relative channel still exists and still belongs to the VR
+            # interface, which has a captured origin to be relative to. This
+            # process simply never speaks that frame -- which is the whole point
+            # of adding a second channel instead of converting in the sender.
+            pan, tilt = extras.get("head_pan"), extras.get("head_tilt")
+            if pan is None or tilt is None:
+                pan, tilt = head_pin_absolute["pan"], head_pin_absolute["tilt"]
+            head.send_absolute_command(wire.SysState.ENGAGED, pan, tilt)
+
         for side, channel in (("arm_left", arm_left), ("arm_right", arm_right)):
             if side not in action.ee_pose:
+                continue
+            # Per arm, inside the loop rather than once above it: during an
+            # intervention the operator holds one arm while the policy keeps
+            # driving the other, so one check for the whole robot would either
+            # freeze the arm the policy still owns or keep commanding the one a
+            # hand is already on. The head deliberately stays pinned either way
+            # -- the wrist view of the arm still running has to stay in
+            # distribution while the other is being corrected.
+            if not arbitrator.arm_allowed(frame, side):
                 continue
             pos = action.ee_pose[side][:3]
             quat = action.ee_pose[side][3:7]
@@ -191,16 +290,37 @@ def main(config_path: str = "configs/system.yaml") -> None:
     )
 
     mode = resolve_mode(cfg)
-    modules = build_modules(cfg, mode, arm_left, arm_right)
-    arbitrator = SystemArbitrator(sys_state, policy_mode=mode, require_confirmation_for=cfg["arbitrator"]["require_confirmation_for"])
+    modules = build_modules(cfg, mode, arm_left, arm_right, head)
+    # state_source: the avatar's SysState comes in on SceneObjectsMsg, not on
+    # the command channel -- see _scene_snapshot and SystemArbitrator's
+    # constructor. Without it engage() waits on a value that never changes.
+    arbitrator = SystemArbitrator(sys_state, policy_mode=mode,
+                                  require_confirmation_for=cfg["arbitrator"]["require_confirmation_for"],
+                                  state_source=lambda: _scene_snapshot(objects))
 
     console = OperatorConsole(arbitrator, sys_state)
     console.start()
 
     print(f"[run] modules: {list(modules)}  mode: {arbitrator.policy_mode}")
     try:
-        if not arbitrator.engage():
-            print("[run] engage aborted (refused confirmation or timed out) -- exiting without running")
+        if mode == INTERVENTION_MODE:
+            # Park the arms BEFORE anything else can command them, and before we
+            # know whether the headset is even up. Until this lands, authority is
+            # UNSET, which gates nothing -- so without it there is a window where
+            # the policy has both arms and possibly nobody is watching.
+            arbitrator.claim_hold()
+            print("[run] intervention: both arms parked in HOLD. Engage from the VR "
+                  "interface, arm the intervention panel, then press RESUME.")
+            # No terminal prompt here on purpose. The operator is in a headset and
+            # cannot see this window; their RESUME press is the confirmation, and
+            # it is given by someone looking at the robot. If it never comes, this
+            # waits forever and nothing moves -- which is the safe outcome.
+            if not arbitrator.await_operator_handover(lambda: _scene_snapshot(objects)):
+                print("[run] no handover from the operator -- exiting without running")
+                return
+        elif not arbitrator.engage():
+            # engage() has already printed which of the two it was.
+            print("[run] engage aborted -- exiting without running")
             return
 
         orchestrator = Orchestrator(live_source, modules)
@@ -209,8 +329,13 @@ def main(config_path: str = "configs/system.yaml") -> None:
         # the policy predicted.
         run_logger = RunLogger()
         action_key = "playback" if mode == "playback" else "policy"
-        actuator = make_actuator(arbitrator, arm_left, arm_right, head, geo["head_look_down_offset"],
-                                  logger=run_logger, action_key=action_key)
+        pcfg = cfg["modules"]["policy"]
+        status_sender = None
+        if action_key == "policy":
+            status_sender = make_status_sender(sys_state, pcfg.get("status_hz", 5.0),
+                                               tuple(pcfg.get("agree_spread", [0.01, 0.05])))
+        actuator = make_actuator(arbitrator, arm_left, arm_right, head, geo["head_pin_absolute"],
+                                  logger=run_logger, action_key=action_key, status_sender=status_sender)
         # Playback ends itself when the recording runs out; a policy run only
         # ever ends on the console or Ctrl+C.
         playback = modules.get("playback")
@@ -238,7 +363,15 @@ def main(config_path: str = "configs/system.yaml") -> None:
         # (also covers Ctrl+C while still waiting on the engage confirm).
         print("\n[run] interrupted -- disengaging and shutting down")
     finally:
-        arbitrator.disengage()
+        if mode == INTERVENTION_MODE:
+            # Park the arms rather than disengaging. The operator owns SysState
+            # here, and requesting IDLE would end THEIR episode the moment this
+            # process exits -- including on a Ctrl+C they did not press. The
+            # avatar's watchdog would reach HOLD on its own 250 ms after we stop
+            # sending anyway; this just makes it immediate and explicit.
+            arbitrator.claim_hold()
+        else:
+            arbitrator.disengage()
         shutdown()
 
 

@@ -3,7 +3,7 @@ ArmStateMsg (raw packed structs, see common.hpp) and the ReliableEnvelope
 protocol (msgpack, see network/udp_reliable.hpp). One place so ArmChannel,
 SysStateClient, and future gaze/object-info clients can't drift on formats
 verified byte-for-byte against teleop-simulator's current common.hpp
-(MsgHeader=23B, ArmCommandMsg=55B, ArmStateMsg=117B, Head*Msg=31B).
+(MsgHeader=23B, ArmCommandMsg=56B, ArmStateMsg=117B, Head*Msg=31B).
 
 These are #pragma pack(1) C structs, so a field added on the C++ side silently
 breaks BOTH directions here: inbound packets fail the size check and are
@@ -80,7 +80,10 @@ def now_ns() -> int:
 _HEADER_FMT = "<IQQBBB"
 HEADER_SIZE = struct.calcsize(_HEADER_FMT)
 
-ARM_CMD_FMT = _HEADER_FMT + "3f4ff"  # + position, quaternion(w,x,y,z), gripper
+# + position, quaternion(w,x,y,z), gripper, clutch.
+# clutch is the operator's clutch state (1 = clutched, hand decoupled from the
+# setpoint); the orchestrator is never clutched, so it sends 0.
+ARM_CMD_FMT = _HEADER_FMT + "3f4ffB"
 ARM_CMD_SIZE = struct.calcsize(ARM_CMD_FMT)
 
 # + position, quat, joints, tau_ext, recovering, gripper_width, grasp_state,
@@ -91,15 +94,18 @@ ARM_STATE_SIZE = struct.calcsize(ARM_STATE_FMT)
 
 def pack_arm_command(*, sequence: int, state: int, device_id: int,
                       position, quaternion, gripper: float,
-                      sample_time_ns: Optional[int] = None) -> bytes:
+                      sample_time_ns: Optional[int] = None,
+                      clutch: int = 0) -> bytes:
     """Packs one ArmCommandMsg; quaternion is (w, x, y, z). sample_time_ns
-    defaults to now: a command is produced at the instant it is sent."""
+    defaults to now: a command is produced at the instant it is sent. clutch
+    defaults to 0 -- a programmatic sender is never clutched, and the avatar
+    logs the field to mark operator repositioning."""
     px, py, pz = position
     qw, qx, qy, qz = quaternion
     now = now_ns()
     return struct.pack(ARM_CMD_FMT, sequence, now, sample_time_ns if sample_time_ns is not None else now,
                         state, FaultCode.NONE, device_id,
-                        px, py, pz, qw, qx, qy, qz, gripper)
+                        px, py, pz, qw, qx, qy, qz, gripper, 1 if clutch else 0)
 
 
 HEAD_CMD_FMT = _HEADER_FMT + "2f"  # + pan, tilt
@@ -195,6 +201,6 @@ def unpack_envelope(data: bytes) -> dict:
 # structs changed; every raw-struct channel silently stops working, so fail at
 # import rather than at 200 Hz in a receive thread.
 assert HEADER_SIZE == 23, HEADER_SIZE
-assert ARM_CMD_SIZE == 55, ARM_CMD_SIZE
+assert ARM_CMD_SIZE == 56, ARM_CMD_SIZE
 assert ARM_STATE_SIZE == 117, ARM_STATE_SIZE
 assert HEAD_CMD_SIZE == HEAD_STATE_SIZE == 31, (HEAD_CMD_SIZE, HEAD_STATE_SIZE)

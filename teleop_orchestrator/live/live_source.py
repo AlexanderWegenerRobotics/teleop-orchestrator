@@ -159,8 +159,17 @@ class LiveSource:
 
             left = self._arm_left.latest()
             right = self._arm_right.latest()
+            # Head pose: the scene publish first, the head channel only as a
+            # fallback. The avatar's head transmission is point-to-point like
+            # every other outbound channel, so when the VR interface is also
+            # running it owns that port and self._head never receives anything.
+            # The same pan/tilt rides SceneObjectsMsg, on a socket with no such
+            # contention, which is what this reads.
             head = self._head.latest()
-            head_pan, head_tilt = (head.pan, head.tilt) if head else (0.0, 0.0)
+            if head is not None:
+                head_pan, head_tilt = head.pan, head.tilt
+            else:
+                head_pan, head_tilt = obj_frame.head_pan, obj_frame.head_tilt
 
             gaze_sample = self._gaze.get(obj_frame.frame_id)
             gaze_ray = None
@@ -200,6 +209,11 @@ class LiveSource:
                 images=images,
                 gaze_valid=gaze_ray is not None,
                 engaged=engaged,
+                authority=obj_frame.authority,
+                # Resolved above (head channel first, scene publish as
+                # fallback). Passed on so no consumer has to repeat it.
+                head_pan=head_pan,
+                head_tilt=head_tilt,
                 grasp_confirmed=grasp_confirmed,
                 candidate_world_pos=world_pos,
             )

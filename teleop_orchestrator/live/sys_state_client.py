@@ -70,6 +70,26 @@ class SysStateClient:
         """Sends a state_change request; not synchronous -- poll .state to see it take effect."""
         self._send("state_change", {"requested_state": requested_state})
 
+    def request_authority(self, authority: int, device: Optional[str] = None) -> None:
+        """Claims or releases arms for the policy (CommandAuthority, see
+        live.object_source.AUTHORITY_*). device=None addresses every arm.
+
+        source is always "orchestrator", which the avatar arbitrates on
+        (Avatar::applyAuthorityRequest): an operator claim outranks this one, so
+        a POLICY request here is REFUSED while the operator holds an arm. That
+        is deliberate -- the policy deciding it is ready again must never take an
+        arm out from under a hand that is mid-correction. HOLD is always
+        honoured, because it is the one request that cannot make anything move.
+
+        Not synchronous. The avatar re-asserts the result every tick inside
+        SceneObjectsMsg, so poll SensorFrame.authority (or the ObjectSource)
+        rather than assuming this took effect.
+        """
+        payload = {"authority": int(authority), "source": "orchestrator"}
+        if device is not None:
+            payload["device"] = device
+        self._send("authority_request", payload, ack_requested=True)
+
     def request_arm_reset(self, device: str) -> None:
         """Requests recovery for one arm ("arm_left"/"arm_right")."""
         self._send("arm_reset", {"device": device}, ack_requested=True)
@@ -94,6 +114,11 @@ class SysStateClient:
         own directory. label is written into the episode_end event.
         """
         self._send("episode_restart", {"label": label}, ack_requested=True)
+
+    def send_policy_status(self, inference_ms: float, agree: float) -> None:
+        """Sends the HUD's policy readouts; the avatar relays them to the interface.
+        Unacknowledged: a lost one is replaced by the next a fifth of a second later."""
+        self._send("policy_status", {"inference_ms": float(inference_ms), "agree": float(agree)})
 
     def _send(self, msg_type: str, payload: dict, ack_requested: bool = False) -> None:
         self._seq += 1

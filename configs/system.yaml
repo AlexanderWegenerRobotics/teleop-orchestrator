@@ -1,25 +1,50 @@
+# Every outbound channel on the avatar is point-to-point -- one remote_ip and
+# remote_port from robot_config, no fan-out. So the VR interface and this
+# process cannot share a receive port: whichever binds first starves the other,
+# and the symptom is that the interface reports the avatar as not alive, stays
+# OFFLINE and locks START and ENGAGE.
+#
+# The receive ports below are therefore the ORCHESTRATOR's own, distinct from
+# the interface's 8000/8001/8002:
+#   - arms listen on the absolute channel's send_port (8011/8012), which the
+#     avatar now publishes ArmStateMsg on as well as transmission_'s.
+#   - the avatar command channel is send-only from here. SysState and per-arm
+#     authority come in on scene_objects instead, which has its own socket.
 network:
   host: 127.0.0.1  # sim and orchestrator on the same machine
 
   avatar:
     send_port: 7000       # -> avatar's receive_port
-    receive_port: 8000    # <- avatar's send_port
+    # Send-only in practice: the avatar's reliable channel answers the VR
+    # interface, not this process. Kept off 8000 so the two can coexist; nothing
+    # is expected to arrive here.
+    receive_port: 8020
 
   arm_left:
     device_id: 1  # wire.DeviceId.LEFT_ARM
     send_port: 7001
-    receive_port: 8001
-    absolute_send_port: 7011  # matches robot_config_avatar.yaml's arm_left.transmission_absolute.receive_port
+    receive_port: 8011        # arm_left.transmission_absolute.send_port
+    absolute_send_port: 7011  # arm_left.transmission_absolute.receive_port
 
   arm_right:
     device_id: 2  # wire.DeviceId.RIGHT_ARM
     send_port: 7002
-    receive_port: 8002
-    absolute_send_port: 7012  # matches robot_config_avatar.yaml's arm_right.transmission_absolute.receive_port
+    receive_port: 8012        # arm_right.transmission_absolute.send_port
+    absolute_send_port: 7012  # arm_right.transmission_absolute.receive_port
 
   head:
+    # Home-relative command port (q0 added on arrival). The VR interface owns
+    # this frame; nothing here sends to it.
     send_port: 7003
-    receive_port: 8003
+    # The ABSOLUTE channel's send_port, exactly as the arms use 8011/8012.
+    # head_control.cpp publishes HeadStateMsg on both channels, so this is a
+    # real head-state feed rather than the dead socket 8023 was -- binding
+    # 8003 would have starved the interface, which is why it moved.
+    receive_port: 8013
+    # head_control.cpp's transmission_absolute.receive_port. pan/tilt sent here
+    # are joint targets, NOT offsets from q0 -- which is the frame a policy
+    # trained on head.csv predicts in.
+    absolute_send_port: 7013
 
   scene_objects:
     receive_port: 7200   # matches robot_config_local.yaml's avatar.scene_objects.port
@@ -38,7 +63,16 @@ geometry:
   camera_name: head_head_cam_left        # key into camera_params.json, for gaze normalization only (stereo left/"primary" eye)
   camera_params_path: ../teleop-simulator/logs/camera_params.json
   n_candidates: 8   # candidate slot capacity; matches training-time padding (episode_to_hdf5.py)
-  head_look_down_offset: {pan: 0.0, tilt: -0.6}
+  # Where to point the head while autonomous with a checkpoint that does NOT
+  # predict head motion. ABSOLUTE joint angles, sent on the head's absolute
+  # channel -- the same frame the policy's own head output uses, so there is
+  # exactly one head frame anywhere in this process.
+  #
+  # Was head_look_down_offset: {tilt: -0.6}, a q0-relative offset. Renamed
+  # rather than reinterpreted: the value changed meaning (-0.6 offset from
+  # q0 -0.4 is -1.0 absolute) and a silently reinterpreted key is precisely
+  # the trap this change exists to remove.
+  head_pin_absolute: {pan: 0.0, tilt: -1.0}
 
 modules:
   intent:
@@ -48,14 +82,20 @@ modules:
 
   policy:
     enabled: true
-    checkpoint: ../teleop-policy/checkpoints/act_sorting_grasp_full/best_grasp.pt  # world-frame proprio/action, sent via ArmChannel.send_absolute_command
-    mode: autonomous      # autonomous | supportive | off -- see SystemArbitrator
+    checkpoint: ../teleop-policy/checkpoints/act_sorting_head/best.pt
+    mode: intervention         # autonomous | intervention
     debug_dump_dir: debug/cam_dump   # e.g. debug/cam_dump, null
     debug_dump_every: 30
+    resume_ramp_s: 0.5
+    status_hz: 5                   # policy_status to the HUD (INF, AGREE), relayed by the avatar
+    agree_spread: [0.01, 0.05]     # ensemble_spread for AGREE 5 pips / 0 pips
 
+    # Resolution the TRAINING images were stored at. teleop-sorting_v2
+    # (episode_policy.hdf5, schema 3) stores every camera at 240x320; the
+    # 120x160 wrist entries were for the v1 episode.hdf5 at image_scale 0.25.
     training_stored_hw:
-      wrist_cam_left:  [120, 160]
-      wrist_cam_right: [120, 160]
+      wrist_cam_left:  [240, 320]
+      wrist_cam_right: [240, 320]
       head_cam_left:   [240, 320]
 
   playback:
@@ -64,7 +104,12 @@ modules:
     #episode: ../teleop-simulator/logs/021
     speed: 1.0          # >1 plays faster than recorded; the sim still has to keep up
     start_ramp_s: 2.0   # blend from the arms' measured pose into the first recorded command
-    replay_head: true   # use the recorded head track instead of geometry.head_look_down_offset
+    replay_head: true   # use the recorded head track instead of geometry.head_pin_absolute
 
 arbitrator:
-  require_confirmation_for: [autonomous, playback]   # modes needing an explicit human confirm before ENGAGED
+  # Modes needing an explicit human confirm before ENGAGED. Intervention is
+  # deliberately NOT here: it never calls engage() at all. The operator engages
+  # from the VR interface and hands an arm over with RESUME, and that press is
+  # the confirmation -- given by someone who can see the robot, rather than
+  # typed into a terminal they cannot see from inside a headset.
+  require_confirmation_for: [autonomous, playback]
