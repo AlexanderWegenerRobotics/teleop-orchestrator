@@ -41,7 +41,8 @@ from teleop_orchestrator.live.object_source import AUTHORITY_POLICY
 # definition of how wide the proprio/action vectors are and whether the head
 # is part of them; duplicating that arithmetic here is exactly how this file
 # ended up 20-dim while the checkpoint had moved to 22.
-from teleop_policy.dataset.teleop_dataset import head_cfg, vector_dim
+from teleop_policy.dataset.teleop_dataset import (action_representation, head_cfg,
+                                                   to_absolute_actions, vector_dim)
 from teleop_policy.dataset.transforms import denormalize, normalize, rot6d_to_matrix
 from teleop_policy.models.act import act as _act_module
 from teleop_policy.models.act.act import ACT
@@ -145,6 +146,62 @@ def _rot6d_to_quat_wxyz(rot6d: np.ndarray) -> np.ndarray:
     return np.array([w, x, y, z])
 
 
+# FR3 joint position limits for joints 5 and 7 (0-based indices 4 and 6), rad.
+# These are the two the wrist winds into: runs 20260924_191355/191451 faulted at
+# q5 = -2.80 and q7 = 3.02. Used only for the warning in _check_joint_margin.
+_FR3_WRIST_LIMITS = {4: 2.8065, 6: 3.0159}
+_JOINT_WARN_MARGIN_RAD = 0.15
+
+
+def _wrap(a: float) -> float:
+    """Angle wrapped into (-pi, pi]."""
+    return float(np.angle(np.exp(1j * a)))
+
+
+def _quat_wxyz_to_matrix(q) -> np.ndarray:
+    from scipy.spatial.transform import Rotation
+    w, x, y, z = q
+    return Rotation.from_quat([x, y, z, w]).as_matrix()
+
+
+def _matrix_to_quat_wxyz(r: np.ndarray) -> np.ndarray:
+    from scipy.spatial.transform import Rotation
+    x, y, z, w = Rotation.from_matrix(r).as_quat()
+    return np.array([w, x, y, z])
+
+
+def _clamp_finger_yaw(r_cmd: np.ndarray, window) -> tuple:
+    """Rotates r_cmd about world z so its finger-axis yaw lies inside window.
+
+    window is (centre, lo, hi) from compute_stats.py's yaw_window: the range of
+    finger yaw the demonstrations visited, as deviations from a circular centre.
+    Returns (rotation, correction_rad); correction is 0 when already inside.
+    """
+    centre, lo, hi = window
+    yaw = np.arctan2(r_cmd[1, 1], r_cmd[0, 1])       # EE y axis = finger axis
+    dev = _wrap(yaw - centre)
+    corr = float(np.clip(dev, lo, hi) - dev)
+    if corr == 0.0:
+        return r_cmd, 0.0
+    c, s = np.cos(corr), np.sin(corr)
+    rz = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    return rz @ r_cmd, corr
+
+
+def _limit_rotation_lead(r_cmd: np.ndarray, r_meas: np.ndarray, max_rad: float) -> tuple:
+    """Pulls r_cmd back along the geodesic so it is at most max_rad from r_meas.
+
+    The rotational twin of the avatar's safety.max_target_lead (5 cm on
+    position). Returns (rotation, lead_rad before limiting).
+    """
+    from scipy.spatial.transform import Rotation
+    rotvec = Rotation.from_matrix(r_meas.T @ r_cmd).as_rotvec()
+    lead = float(np.linalg.norm(rotvec))
+    if lead <= max_rad or lead < 1e-9:
+        return r_cmd, lead
+    return r_meas @ Rotation.from_rotvec(rotvec * (max_rad / lead)).as_matrix(), lead
+
+
 def _preprocess_image(img: np.ndarray, hw: tuple, stored_hw: Optional[tuple] = None) -> np.ndarray:
     """Resizes to (h, w) and scales to [0, 1] -- matches replay_utils.load_image.
 
@@ -190,7 +247,11 @@ class PolicyModule:
                  debug_dump_every: int = 30,
                  stored_hw: Optional[dict] = None,
                  timing_every: int = 0,
-                 resume_ramp_s: float = 0.5):
+                 resume_ramp_s: float = 0.5,
+                 max_rot_lead_deg: float = 30.0,
+                 yaw_clamp: bool = True,
+                 ensemble_m: float = M_ENSEMBLE,
+                 gripper_ensemble_m: float = M_ENSEMBLE):
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         # Say this out loud. A CPU-only torch build silently falls back here,
         # and the only symptom is that the whole loop runs several times slower
@@ -220,6 +281,7 @@ class PolicyModule:
         # appends the head after every arm, so the arms keep the offsets they
         # always had and only the tail is new.
         self._n_arm_dims = self.dcfg["action"]["dims_per_arm"] * len(self.dcfg["action"]["arms"])
+        print(f"[PolicyModule] action representation: {action_representation(self.dcfg)}")
         if self._head_cfg:
             print(f"[PolicyModule] checkpoint includes head joints "
                   f"(proprio/action dim {vector_dim(self.dcfg)}); head pose read from SensorFrame")
@@ -271,6 +333,34 @@ class PolicyModule:
         self._resume_ramp_s = float(resume_ramp_s)
         # monotonic() at which each arm was handed back, or absent if not ramping.
         self._resume_t0: dict = {}
+        # Orientation guard; see _guard_orientation. <= 0 disables the lead limit.
+        self._max_rot_lead = np.radians(max_rot_lead_deg) if max_rot_lead_deg > 0 else None
+        # Finger-yaw window per arm from the stats file (compute_stats.py writes
+        # it). Stats files older than the guard do not have it, and then only the
+        # lead limit applies -- said once, loudly, rather than silently.
+        self._yaw_window = None
+        if yaw_clamp and "yaw_window" in self.stats:
+            self._yaw_window = {arm: tuple(w) for arm, w in
+                                zip(self.dcfg["proprio"]["arms"], self.stats["yaw_window"])}
+            for arm, (c, lo, hi) in self._yaw_window.items():
+                print(f"[PolicyModule] {arm} finger-yaw clamp: [{np.degrees(c + lo):.1f}, "
+                      f"{np.degrees(c + hi):.1f}] deg (from the demonstrations)")
+        elif yaw_clamp:
+            print("[PolicyModule] WARNING: stats file has no yaw_window (re-run compute_stats.py); "
+                  "commanded orientation is NOT clamped to the demonstrated range")
+        self._joint_warned: dict = {}
+        # Temporal-ensemble decay, w_i = exp(-m * age). 0.01 (ALOHA) is nearly
+        # uniform over ~40 overlapping chunks, i.e. a ~2 s average: smooth, but it
+        # blends chunks that head for DIFFERENT parcels into a hover between them
+        # (log 095: 75 s parked mid-table after the first place). Larger m trusts
+        # the freshest chunks: 0.1 -> the last ~0.5 s dominates.
+        self._ensemble_m = float(ensemble_m)
+        # Gripper width columns (dim 9 of every arm block); see _ensemble.
+        self._gripper_ensemble_m = float(gripper_ensemble_m)
+        self._gripper_cols = [i * self._d + 9 for i in range(len(self.dcfg["action"]["arms"]))]
+        print(f"[PolicyModule] gripper_ensemble_m = {self._gripper_ensemble_m}")
+        print(f"[PolicyModule] ensemble_m = {self._ensemble_m} "
+              f"(newest chunk weight {1.0 / np.exp(-self._ensemble_m * np.arange(self._K)).sum():.2f})")
 
     def reset(self) -> None:
         """Clears the rolling chunk-prediction buffer at an episode boundary."""
@@ -370,6 +460,60 @@ class PolicyModule:
                 _slerp_wxyz(meas_quat, pose[3:7], alpha),
             ])
         return alphas
+
+    def _guard_orientation(self, ee_pose: dict, measured: dict) -> dict:
+        """Keeps commanded orientation where the demonstrations went. Mutates
+        ee_pose; returns extras {guard_yaw_deg_<side>, guard_rot_lead_deg_<side>}.
+
+        Two independent limits, in this order:
+
+        1. Finger yaw clamped into the window the demonstrations visited
+           (stats yaw_window). This is the one that matters: with relative_ee
+           orientation, runs 20260924_191355 and _191451 wound the right wrist
+           from -80 to -152 deg at ~7 deg/s until q7 hit its limit and the arm
+           FAULTED. The demonstrated window for that arm ends near -125 deg.
+        2. Rotational lead over the measured pose capped at max_rot_lead_deg, so
+           no single tick can ask for a large rotation step even inside the
+           window. Position already has the avatar's 5 cm max_target_lead.
+
+        Position and gripper are untouched. Applied after the ensemble and
+        before the resume ramp, so the ramp blends into an already-safe target.
+        """
+        extras = {}
+        for side, pose in ee_pose.items():
+            state = measured.get(side)
+            r_cmd = _quat_wxyz_to_matrix(pose[3:7])
+            corr = 0.0
+            if self._yaw_window is not None and side in self._yaw_window:
+                r_cmd, corr = _clamp_finger_yaw(r_cmd, self._yaw_window[side])
+            lead = 0.0
+            if self._max_rot_lead is not None and state is not None:
+                r_cmd, lead = _limit_rotation_lead(r_cmd, _quat_wxyz_to_matrix(state.quaternion),
+                                                   self._max_rot_lead)
+            ee_pose[side] = np.concatenate([np.asarray(pose[:3], dtype=np.float64),
+                                            _matrix_to_quat_wxyz(r_cmd)])
+            short = side[4:]
+            extras[f"guard_yaw_deg_{short}"] = float(np.degrees(corr))
+            extras[f"guard_rot_lead_deg_{short}"] = float(np.degrees(lead))
+            if state is not None:
+                self._check_joint_margin(side, state)
+        return extras
+
+    def _check_joint_margin(self, side: str, state) -> None:
+        """Prints once per approach when a wrist joint is near its FR3 limit.
+
+        Warning only. The yaw clamp is the fix; this is how you find out that
+        the clamp was not enough, before the sim faults rather than after.
+        """
+        joints = getattr(state, "joints", None)
+        if joints is None:
+            return
+        near = [(i, joints[i]) for i, lim in _FR3_WRIST_LIMITS.items()
+                if abs(joints[i]) > lim - _JOINT_WARN_MARGIN_RAD]
+        if near and not self._joint_warned.get(side):
+            print(f"[PolicyModule] WARNING: {side} wrist near joint limit: "
+                  + ", ".join(f"q{i + 1}={q:+.3f} (limit {_FR3_WRIST_LIMITS[i]:.3f})" for i, q in near))
+        self._joint_warned[side] = bool(near)
 
     def _apply_head_ramp(self, pan: float, tilt: float,
                          meas_pan: float, meas_tilt: float, ramp: dict):
@@ -476,6 +620,13 @@ class PolicyModule:
         with torch.no_grad():
             a_hat, _, _ = self.model(images_t, proprio_t)  # z=0 at inference (actions=None)
         a_hat = denormalize(a_hat[0].cpu().numpy(), self.stats["action_mean"], self.stats["action_std"])
+        # A relative_ee checkpoint predicts every arm pose in the frame of the
+        # measured EE pose this tick's proprio was built from. Converted back to
+        # world poses HERE, per prediction and before ensembling, because chunks
+        # from different ticks have different reference poses and averaging them
+        # in their own frames would be meaningless. Must be the same unnormalized
+        # proprio that went into the model. No-op for absolute checkpoints.
+        a_hat = to_absolute_actions(a_hat, proprio, self.dcfg)
         t_fwd = time.perf_counter()
 
         action = self._ensemble(self._slot_index(frame.timestamp_ns), a_hat)
@@ -488,9 +639,12 @@ class PolicyModule:
             "arm_left": np.concatenate([left_action[:3], _rot6d_to_quat_wxyz(left_action[3:9])]),
             "arm_right": np.concatenate([right_action[:3], _rot6d_to_quat_wxyz(right_action[3:9])]),
         }
-        # After the ensemble, before anything leaves: the ramp is about what goes
-        # on the wire, not about what the model thinks.
-        ramp = self._apply_resume_ramp(ee_pose, {"arm_left": left, "arm_right": right})
+        # After the ensemble, before anything leaves: the guard and the ramp are
+        # about what goes on the wire, not about what the model thinks. Guard
+        # first, so the ramp walks into a target that is already inside limits.
+        measured = {"arm_left": left, "arm_right": right}
+        guard_extras = self._guard_orientation(ee_pose, measured)
+        ramp = self._apply_resume_ramp(ee_pose, measured)
 
         # Head, taken from the ENSEMBLED vector rather than a_hat[0]. _ensemble
         # averages every column with the same weights, so the neck gets the
@@ -542,6 +696,9 @@ class PolicyModule:
                 # head.send_command, in place of the fixed look-down offset it
                 # falls back to for a checkpoint without a head.
                 **head_extras,
+                # Non-zero guard_yaw_deg_* means the policy asked for a wrist yaw
+                # outside what the demonstrations visited and was clamped back.
+                **guard_extras,
             },
         )
 
@@ -581,7 +738,31 @@ class PolicyModule:
         """
         if self._t0_ns is None:
             self._t0_ns = timestamp_ns
-        return int(round((timestamp_ns - self._t0_ns) * 1e-9 * self._rate_hz))
+            self._last_slot = None
+        target = (timestamp_ns - self._t0_ns) * 1e-9 * self._rate_hz
+        last = getattr(self, "_last_slot", None)
+        if last is None:
+            slot = int(round(target))
+        else:
+            # Quantize with hysteresis relative to the previous slot instead of
+            # rounding the absolute time. Plain round() flips between steps of 0
+            # and 2 whenever the tick phase drifts to a slot boundary (+-10 ms of
+            # tick jitter on a 50 ms slot): runs 20260926_183735/183835 had 15-18 %
+            # repeated slots in bursts, each one a visible jerk. Here a normal
+            # 40-60 ms tick always advances exactly one slot; a slow loop still
+            # advances ~1.4 slots per 70 ms tick on average (the 14 Hz case in
+            # per-arm-authority-yields-no-data.md). The slot tracks real time within
+            # +-0.75 of a slot; a correction moves it by a whole slot, which puts it
+            # well inside the band again, so corrections cannot ping-pong.
+            ahead = target - (last + 1)          # real time minus the plain next slot
+            if ahead > 0.75:
+                slot = last + 1 + int(round(ahead))
+            elif ahead < -0.75:
+                slot = last                      # loop running fast: hold this slot once
+            else:
+                slot = last + 1
+        self._last_slot = slot
+        return slot
 
     def _ensemble(self, t: int, a_hat: np.ndarray) -> np.ndarray:
         """Appends this tick's K-step chunk prediction into the rolling
@@ -594,7 +775,16 @@ class PolicyModule:
         """
         for i in range(self._K):
             self._pending.setdefault(t + i, []).append(a_hat[i])
-        preds = np.stack(self._pending.pop(t, [a_hat[0]]))
+        # get, not pop. Tick times jitter around the 50 ms slot width, and when the
+        # tick phase sits near a slot boundary, round() maps two consecutive ticks
+        # onto the SAME slot (and then skips one). With pop, the second tick found
+        # slot t empty except for its own fresh chunk, so it sent a single raw
+        # a_hat[0] instead of the ensemble -- a jump of several mm, every 3-4
+        # ticks while the phase drifted through the boundary. Runs
+        # 20260926_183735/183835: 15-18 % of ticks, the visible arm jitter.
+        # Keeping slot t until a later slot is reached makes a repeated slot
+        # re-ensemble the same predictions plus the new one.
+        preds = np.stack(self._pending.get(t, [a_hat[0]]))
 
         # frame_id does not advance by exactly 1 per tick (measured stride 2-3,
         # since the policy ticks slower than the source publishes), so every
@@ -603,9 +793,8 @@ class PolicyModule:
         # inserts vs ~K/stride pops per tick, i.e. a few hundred orphaned
         # 20-float arrays per second, unbounded. Nothing behind us can ever be
         # consumed again, so drop it.
-        if len(self._pending) > 2 * self._K:
-            for key in [k for k in self._pending if k < t]:
-                del self._pending[key]
+        for key in [k for k in self._pending if k < t]:
+            del self._pending[key]
 
         # Spread across the chunks that all predicted this slot, from different
         # observations at different times. It is free here (preds is already
@@ -621,6 +810,18 @@ class PolicyModule:
         self._last_spread = float(preds.std(axis=0).mean()) if len(preds) > 1 else 0.0
 
         ages = np.arange(len(preds))[::-1]  # 0 = most recent prediction
-        w = np.exp(-M_ENSEMBLE * ages)
+        w = np.exp(-self._ensemble_m * ages)
         w /= w.sum()
-        return (w[:, None] * preds).sum(axis=0)
+        out = (w[:, None] * preds).sum(axis=0)
+        # Gripper columns get their own, slower decay. Every chunk puts the close
+        # near its END ("close in ~2 s"), so a fresh-weighted average stays open
+        # forever: with ensemble_m 0.1 the ensembled width never dropped below
+        # 0.041 in runs 20260926_182536/182649/182731 (0 closes) while
+        # chunk_grip_last was < 0.03 on >90% of ticks. The old near-uniform
+        # average is what let the close through; GripperLatch in run.py removes
+        # the chatter that came with it.
+        if self._gripper_cols and self._gripper_ensemble_m != self._ensemble_m:
+            wg = np.exp(-self._gripper_ensemble_m * ages)
+            wg /= wg.sum()
+            out[self._gripper_cols] = (wg[:, None] * preds[:, self._gripper_cols]).sum(axis=0)
+        return out

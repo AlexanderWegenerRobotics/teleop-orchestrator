@@ -4,16 +4,24 @@ SystemArbitrator together per configs/system.yaml, then runs the
 orchestrator loop against the sim (or hardware speaking the same protocol).
 
 Usage: python run.py [path/to/system.yaml]
+       python run.py [path/to/system.yaml] --trials 10 --timeout 90 [--name v4]
+           evaluation: N autonomous trials of --timeout seconds each, arms homed
+           and a new scene loaded between them (teleop_orchestrator/evaluation.py).
+           Score afterwards with scripts/evaluate_policy.py.
 """
 
 from __future__ import annotations
 
+import argparse
+import os
 import sys
 import time
+from typing import Optional
 
 import yaml
 
-from teleop_orchestrator.arbitrator import INTERVENTION_MODE, SystemArbitrator
+from teleop_orchestrator.arbitrator import EVALUATE_MODE, INTERVENTION_MODE, SystemArbitrator
+from teleop_orchestrator.evaluation import EvalSession, RoutingLogger
 from teleop_orchestrator.intent_factory import build_intent_model
 from teleop_orchestrator.live import wire
 from teleop_orchestrator.live.arm_channel import ArmChannel
@@ -116,7 +124,11 @@ def build_modules(cfg: dict, mode: str, arm_left: ArmChannel, arm_right: ArmChan
                                           debug_dump_dir=dbg,
                                           debug_dump_every=mcfg["policy"].get("debug_dump_every", 30),
                                           stored_hw=stored,
-                                          resume_ramp_s=mcfg["policy"].get("resume_ramp_s", 0.5))
+                                          resume_ramp_s=mcfg["policy"].get("resume_ramp_s", 0.5),
+                                          max_rot_lead_deg=mcfg["policy"].get("max_rot_lead_deg", 30.0),
+                                          yaw_clamp=mcfg["policy"].get("yaw_clamp", True),
+                                          ensemble_m=mcfg["policy"].get("ensemble_m", 0.01),
+                                          gripper_ensemble_m=mcfg["policy"].get("gripper_ensemble_m", 0.01))
     return modules
 
 
@@ -125,6 +137,42 @@ def build_modules(cfg: dict, mode: str, arm_left: ArmChannel, arm_right: ArmChan
 # midpoint; ACT's L1 output is continuous so it needs thresholding somewhere.
 _GRIPPER_OPEN_WIDTH_M = 0.08
 _GRIPPER_CLOSE_THRESHOLD_M = 0.04
+
+
+class GripperLatch:
+    """Close flag with hysteresis and a minimum hold, one per arm.
+
+    The ensembled width is an average of ~40 chunk predictions. Near a grasp it
+    hovers around the 0.04 m midpoint, so a single threshold flips every tick or
+    two: logs 095/096 show 45 closes in two runs, mostly bursts 0.1-0.2 s apart,
+    many before the fingers reached grasp depth, each one shoving the parcel.
+
+    Close when the width drops below close_below; re-open only once it rises
+    above open_above AND the gripper has been closed for min_hold_s. The human
+    demos hold a successful grasp 1.9-4.2 s, so a 1 s hold never cuts a real
+    carry short. close_below == open_above with min_hold_s 0 is the old
+    single-threshold behaviour.
+    """
+
+    def __init__(self, close_below: float = 0.03, open_above: float = 0.06, min_hold_s: float = 1.0):
+        self.close_below, self.open_above, self.min_hold_s = close_below, open_above, min_hold_s
+        self._closed: dict = {}
+        self._t_closed: dict = {}
+
+    def __call__(self, side: str, width: float, now: float) -> float:
+        closed = self._closed.get(side, False)
+        if not closed and width < self.close_below:
+            closed = True
+            self._t_closed[side] = now
+        elif closed and width > self.open_above and now - self._t_closed.get(side, now) >= self.min_hold_s:
+            closed = False
+        self._closed[side] = closed
+        return 1.0 if closed else 0.0
+
+    def reset(self) -> None:
+        """Forget both arms' latched state (a new trial starts with the gripper open)."""
+        self._closed.clear()
+        self._t_closed.clear()
 
 
 def agree_from_spread(spread: float, spread_full: float, spread_zero: float) -> float:
@@ -151,12 +199,17 @@ def make_status_sender(sys_state: SysStateClient, status_hz: float, agree_spread
 
 def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right: ArmChannel,
                    head: HeadChannel, head_pin_absolute: dict,
-                   logger=None, action_key: str = "policy", status_sender=None):
+                   logger=None, action_key: str = "policy", status_sender=None,
+                   gripper_latch: Optional["GripperLatch"] = None,
+                   gate=None):
     """Returns the Orchestrator.run(on_tick=...) callback that sends the acting
     module's ActionOutput to the arms -- only when autonomous_allowed, so
     supportive/off mode never issues an ArmCommandMsg regardless of what the
     module predicts. action_key names that module ("policy" or "playback");
     everything below this line is identical for both, which is the point.
+    gate, if given, is a zero-argument callable; nothing is sent (arms or head)
+    on ticks where it returns False -- the evaluation loop uses it to keep the
+    policy off the arms while they are homed between trials.
     Uses send_absolute_command: the retrained checkpoint predicts absolute
     world-frame poses (see teleop-policy/configs/dataset.yaml), which the sim
     only interprets correctly on the absolute channel (worldAbsoluteToBase),
@@ -171,6 +224,35 @@ def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right:
     Playback overrides it per tick with the head track it recorded
     (extras head_pan/head_tilt), which is strictly better when available.
     """
+    # Last SysState reported by each arm itself, for printing transitions once.
+    last_arm_state: dict = {}
+
+    def arm_is_engaged(side: str, channel: ArmChannel) -> bool:
+        """True only if the arm's own ArmStateMsg says ENGAGED.
+
+        The arbitrator's authority gate says who MAY command an arm; it does not
+        know whether the arm can move. After a FAULT (e.g. a wrist joint limit)
+        the arm is frozen, but the policy kept predicting and this kept sending,
+        which looked like the policy hesitating over a parcel (runs
+        20260924_191355/191451). Commands to a non-ENGAGED arm do nothing, so
+        stop sending them and say so, once per transition.
+        """
+        st = channel.latest()
+        state = None if st is None else int(st.state)
+        prev = last_arm_state.get(side, wire.SysState.ENGAGED)
+        if state != prev:
+            name = "no state" if state is None else wire.SysState.NAMES.get(state, str(state))
+            if state == wire.SysState.ENGAGED:
+                print(f"[run] {side} is ENGAGED again; resuming commands")
+            else:
+                detail = ""
+                if st is not None and state == wire.SysState.FAULT:
+                    detail = (f" fault_code={st.fault_code} q=" +
+                              " ".join(f"{q:+.3f}" for q in st.joints))
+                print(f"[run] {side} is {name.upper()}, not commanding it{detail}")
+            last_arm_state[side] = state
+        return state == wire.SysState.ENGAGED
+
     def on_tick(frame, outputs) -> None:
         action = outputs.get(action_key)
         if action is None:
@@ -181,6 +263,8 @@ def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right:
         if status_sender is not None:
             status_sender(extras)
         if not action.ee_pose or not arbitrator.autonomous_allowed:
+            return
+        if gate is not None and not gate():
             return
 
         # The head is pinned only while this process is actually driving
@@ -239,6 +323,8 @@ def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right:
             # distribution while the other is being corrected.
             if not arbitrator.arm_allowed(frame, side):
                 continue
+            if not arm_is_engaged(side, channel):
+                continue
             pos = action.ee_pose[side][:3]
             quat = action.ee_pose[side][3:7]
             # ArmCommandMsg.gripper is a BOOLEAN CLOSE FLAG on the sim side, not a
@@ -254,7 +340,10 @@ def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right:
             # conventions are also INVERTED (small width = closed, large flag =
             # close), so this is a threshold-and-invert, not a rescale.
             width = action.gripper.get(side, _GRIPPER_OPEN_WIDTH_M)
-            close_flag = 1.0 if width < _GRIPPER_CLOSE_THRESHOLD_M else 0.0
+            if gripper_latch is not None:
+                close_flag = gripper_latch(side, width, time.monotonic())
+            else:
+                close_flag = 1.0 if width < _GRIPPER_CLOSE_THRESHOLD_M else 0.0
             channel.send_absolute_command(wire.SysState.ENGAGED, pos, quat, close_flag)
             if logger is not None:
                 logger.log_gripper(side, width=width, close_flag=close_flag)
@@ -262,8 +351,57 @@ def make_actuator(arbitrator: SystemArbitrator, arm_left: ArmChannel, arm_right:
     return on_tick
 
 
-def main(config_path: str = "configs/system.yaml") -> None:
+def build_evaluation(cfg: dict, args, config_path: str, sys_state, arm_left, arm_right,
+                     run_logger, policy, latch) -> EvalSession:
+    """EvalSession from system.yaml's modules.policy.evaluation block, with
+    --trials/--timeout/--name/--out taking precedence."""
+    pcfg = cfg["modules"]["policy"]
+    ecfg = dict(pcfg.get("evaluation") or {})
+    for key, val in (("trials", args.trials), ("timeout_s", args.timeout),
+                     ("name", args.name), ("out_dir", args.out)):
+        if val is not None:
+            ecfg[key] = val
+    ckpt = pcfg["checkpoint"]
+    # Default name: the checkpoint's folder, e.g. act_sorting_relpos_v4.
+    name = ecfg.get("name") or os.path.basename(os.path.dirname(os.path.normpath(ckpt))) or "eval"
+    run_id = f"{name}_{time.strftime('%Y%m%d_%H%M%S')}"
+    out_dir = os.path.join(ecfg.get("out_dir", "logs/eval"), run_id)
+    policy_snapshot = {k: v for k, v in pcfg.items() if k not in ("evaluation",)}
+
+    def on_trial_start() -> None:
+        policy.reset()
+        if latch is not None:
+            latch.reset()
+
+    return EvalSession(
+        n_trials=int(ecfg.get("trials", 10)), timeout_s=float(ecfg.get("timeout_s", 90.0)),
+        sys_state=sys_state, arms={"arm_left": arm_left, "arm_right": arm_right},
+        logger=run_logger, out_dir=out_dir, run_id=run_id, on_trial_start=on_trial_start,
+        settle_s=float(ecfg.get("settle_s", 1.5)),
+        reset_timeout_s=float(ecfg.get("reset_timeout_s", 45.0)),
+        meta={"checkpoint": ckpt, "config_path": config_path,
+              "created": time.strftime("%Y-%m-%dT%H:%M:%S"), "policy": policy_snapshot})
+
+
+def parse_args(argv=None):
+    ap = argparse.ArgumentParser(description="Run the orchestrator against the sim.")
+    ap.add_argument("config", nargs="?", default="configs/system.yaml")
+    ap.add_argument("--trials", type=int, default=None,
+                    help="evaluation: number of trials (switches policy.mode to 'evaluate')")
+    ap.add_argument("--timeout", type=float, default=None,
+                    help="evaluation: length of each trial in seconds")
+    ap.add_argument("--name", default=None,
+                    help="evaluation: run name prefix (default: the checkpoint's folder name)")
+    ap.add_argument("--out", default=None, help="evaluation: parent folder (default logs/eval)")
+    return ap.parse_args(argv)
+
+
+def main(args=None) -> None:
+    args = args if args is not None else parse_args([])
+    config_path = args.config
     cfg = load_config(config_path)
+    if args.trials is not None or args.timeout is not None:
+        cfg["modules"]["policy"]["mode"] = EVALUATE_MODE
     net, geo = cfg["network"], cfg["geometry"]
     host = net["host"]
 
@@ -302,6 +440,9 @@ def main(config_path: str = "configs/system.yaml") -> None:
     console.start()
 
     print(f"[run] modules: {list(modules)}  mode: {arbitrator.policy_mode}")
+    if mode == EVALUATE_MODE and "policy" not in modules:
+        raise ValueError("evaluate mode needs modules.policy.enabled: true")
+    evaluation: Optional[EvalSession] = None
     try:
         if mode == INTERVENTION_MODE:
             # Park the arms BEFORE anything else can command them, and before we
@@ -327,21 +468,44 @@ def main(config_path: str = "configs/system.yaml") -> None:
         # Constructed here rather than inside run() so the actuator can log what
         # it actually put on the wire (see RunLogger.log_gripper) alongside what
         # the policy predicted.
-        run_logger = RunLogger()
+        run_logger = RoutingLogger() if mode == EVALUATE_MODE else RunLogger()
         action_key = "playback" if mode == "playback" else "policy"
         pcfg = cfg["modules"]["policy"]
         status_sender = None
         if action_key == "policy":
             status_sender = make_status_sender(sys_state, pcfg.get("status_hz", 5.0),
                                                tuple(pcfg.get("agree_spread", [0.01, 0.05])))
+        # Policy only: playback replays recorded 0/0.08 widths, which need no latch
+        # and should reproduce the recording exactly.
+        latch = None
+        if action_key == "policy":
+            g = pcfg.get("gripper", {}) or {}
+            latch = GripperLatch(close_below=g.get("close_below", 0.03),
+                                 open_above=g.get("open_above", 0.06),
+                                 min_hold_s=g.get("min_hold_s", 1.0))
+            print(f"[run] gripper latch: close < {latch.close_below} m, open > {latch.open_above} m "
+                  f"after >= {latch.min_hold_s} s")
+        if mode == EVALUATE_MODE:
+            evaluation = build_evaluation(cfg, args, config_path, sys_state, arm_left, arm_right,
+                                          run_logger, modules["policy"], latch)
         actuator = make_actuator(arbitrator, arm_left, arm_right, head, geo["head_pin_absolute"],
-                                  logger=run_logger, action_key=action_key, status_sender=status_sender)
+                                  logger=run_logger, action_key=action_key, status_sender=status_sender,
+                                  gripper_latch=latch,
+                                  gate=(lambda: evaluation.acting) if evaluation is not None else None)
+        on_tick = actuator
+        if evaluation is not None:
+            def on_tick(frame, outputs):
+                evaluation.tick(frame)     # trial timer, start/end, logger swap
+                actuator(frame, outputs)
         # Playback ends itself when the recording runs out; a policy run only
         # ever ends on the console or Ctrl+C.
         playback = modules.get("playback")
         should_stop = (console.stop_requested if playback is None
                        else lambda: console.stop_requested() or playback.finished)
-        logger = orchestrator.run(logger=run_logger, on_tick=actuator, should_stop=should_stop)
+        if evaluation is not None:
+            should_stop = lambda: console.stop_requested() or evaluation.finished
+            evaluation.begin()
+        logger = orchestrator.run(logger=run_logger, on_tick=on_tick, should_stop=should_stop)
         if logger.n_ticks == 0:
             # LiveSource ticks on SceneObjectsMsg and gives up after a couple of
             # seconds of silence, so a run that ends here never saw the sim at
@@ -351,6 +515,11 @@ def main(config_path: str = "configs/system.yaml") -> None:
                   f"{net['scene_objects']['receive_port']} within LiveSource's tick timeout. "
                   f"Check the avatar's robot_config avatar.scene_objects block is present and "
                   f"enabled, and that it points at this host/port.")
+        if evaluation is not None:
+            # Each trial was saved on its own as it ended; there is no whole-run log.
+            evaluation.close(stopped=console.stop_requested())
+            evaluation = None
+            return
         log_path = f"logs/run_{time.strftime('%Y%m%d_%H%M%S')}.hdf5"
         meta = {"policy_mode": arbitrator.policy_mode, "config_path": config_path}
         if playback is not None:
@@ -358,6 +527,9 @@ def main(config_path: str = "configs/system.yaml") -> None:
         logger.save(log_path, meta=meta)
         print(f"[run] saved {log_path}")
     except KeyboardInterrupt:
+        if evaluation is not None:
+            evaluation.close(stopped=True)
+            evaluation = None
         # Ctrl+C is the emergency-stop path -- same cleanup as a graceful
         # 'stop', just triggered from the keyboard instead of the console
         # (also covers Ctrl+C while still waiting on the engage confirm).
@@ -376,4 +548,4 @@ def main(config_path: str = "configs/system.yaml") -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "configs/system.yaml")
+    main(parse_args())

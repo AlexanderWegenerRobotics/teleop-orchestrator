@@ -29,7 +29,12 @@ INTERVENTION_MODE = "intervention"
 # "intervention" actuates exactly as "autonomous" does -- the difference is not
 # what it sends but who is allowed to, and that is the avatar's per-arm
 # authority rather than a mode.
-ACTUATING_MODES = ("autonomous", "playback", "intervention")
+#
+# "evaluate" is autonomous with a trial loop around it (teleop_orchestrator/
+# evaluation.py): N trials of a fixed length, arms homed and a new scene loaded
+# between them. For the arbitrator it is autonomous in every respect.
+EVALUATE_MODE = "evaluate"
+ACTUATING_MODES = ("autonomous", "playback", "intervention", EVALUATE_MODE)
 
 
 class SystemArbitrator:

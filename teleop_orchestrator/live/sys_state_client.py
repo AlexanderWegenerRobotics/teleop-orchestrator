@@ -34,6 +34,7 @@ class SysStateClient:
         self._seq = 0
         self._state = wire.SysState.OFFLINE
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._running = False
         self._recv_thread: Optional[threading.Thread] = None
         self._heartbeat_thread: Optional[threading.Thread] = None
@@ -120,10 +121,26 @@ class SysStateClient:
         Unacknowledged: a lost one is replaced by the next a fifth of a second later."""
         self._send("policy_status", {"inference_ms": float(inference_ms), "agree": float(agree)})
 
+    def request_reset_all(self, reason: str = "reset_all") -> None:
+        """Sends every arm home (recovery to q0) WITHOUT ending the episode.
+
+        Avatar's reset_all handler starts an OPERATOR_RESET recovery on every
+        arm; once all of them wait for the ack it confirms them itself
+        (processResetAllCompletion) and returns to ENGAGED. It deliberately does
+        not call markEpisodeEnd -- that is left to a following episode_restart,
+        which is exactly the VR home button's sequence and what the evaluation
+        loop uses between trials. Recovers FAULTed arms on the way.
+        """
+        self._send("reset_all", {"reason": reason}, ack_requested=True)
+
     def _send(self, msg_type: str, payload: dict, ack_requested: bool = False) -> None:
-        self._seq += 1
-        packed = wire.pack_envelope(self._seq, msg_type, payload, self.state, ack_requested)
-        self._sock.sendto(packed, (self.remote_ip, self.send_port))
+        # Locked: the heartbeat thread, the console worker and the evaluation
+        # reset thread all send, and two envelopes with the same sequence number
+        # could be dropped as a duplicate by the avatar's reliable channel.
+        with self._send_lock:
+            self._seq += 1
+            packed = wire.pack_envelope(self._seq, msg_type, payload, self.state, ack_requested)
+            self._sock.sendto(packed, (self.remote_ip, self.send_port))
 
     def _heartbeat_loop(self) -> None:
         while self._running:

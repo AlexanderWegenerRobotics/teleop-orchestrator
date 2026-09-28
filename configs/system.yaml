@@ -82,11 +82,47 @@ modules:
 
   policy:
     enabled: true
-    checkpoint: ../teleop-policy/checkpoints/act_sorting_head/best.pt
-    mode: intervention         # autonomous | intervention
+    checkpoint: ../teleop-policy/checkpoints/act_sorting_relpos_v3/best.pt
+    mode: autonomous         # autonomous | intervention | evaluate
+    # evaluate: autonomous in N trials of fixed length, arms homed (reset_all)
+    # and a new scene loaded (episode_restart) between trials. `run.py --trials N
+    # --timeout S` switches to it without editing this file. Everything goes to
+    # out_dir/<name>_<timestamp>/ (manifest.json + trial_XX.hdf5); score with
+    # scripts/evaluate_policy.py. For identical layouts across checkpoints, run
+    # the episode config server in replay mode over fixed episodes (see there).
+    evaluation:
+      trials: 10
+      timeout_s: 90          # the only stop rule; the task's end is scored offline
+      name: null             # default: the checkpoint's folder name
+      out_dir: logs/eval
+      settle_s: 1.5          # after episode_restart, before the next trial starts
+      reset_timeout_s: 45    # arms must be back ENGAGED within this after reset_all
     debug_dump_dir: debug/cam_dump   # e.g. debug/cam_dump, null
     debug_dump_every: 30
     resume_ramp_s: 0.5
+    # Orientation guard (policy_module._guard_orientation), applied to every
+    # command before it is sent. yaw_clamp keeps the finger yaw inside the range
+    # the demonstrations visited (yaw_window in the checkpoint's stats file,
+    # written by compute_stats.py); max_rot_lead_deg caps how far the commanded
+    # orientation may lead the measured one. Both exist because relative_ee
+    # wound the right wrist into its joint limit (runs 20260924_191355/191451).
+    yaw_clamp: true
+    max_rot_lead_deg: 30.0
+    # Temporal-ensemble decay w_i = exp(-m * age). 0.01 = ALOHA default, a ~2 s
+    # near-uniform average; 0.1 lets the last ~0.5 s dominate so the policy can
+    # commit to one parcel instead of hovering between two. Try 0.1, then 0.2.
+    ensemble_m: 0.1
+    # Gripper width is ensembled separately. Chunks always predict the close at
+    # their end, so a fresh-weighted average never closes (runs 20260926_1825xx:
+    # 0 closes at 0.1). Keep the slow ALOHA average here; GripperLatch stops chatter.
+    gripper_ensemble_m: 0.01
+    # Close flag with hysteresis (run.py GripperLatch): close below close_below,
+    # re-open only above open_above and after min_hold_s. Stops the open/close
+    # chatter at the 0.04 midpoint. close_below == open_above, min_hold_s 0 = old behaviour.
+    gripper:
+      close_below: 0.03
+      open_above: 0.06
+      min_hold_s: 1.0
     status_hz: 5                   # policy_status to the HUD (INF, AGREE), relayed by the avatar
     agree_spread: [0.01, 0.05]     # ensemble_spread for AGREE 5 pips / 0 pips
 
@@ -112,4 +148,4 @@ arbitrator:
   # from the VR interface and hands an arm over with RESUME, and that press is
   # the confirmation -- given by someone who can see the robot, rather than
   # typed into a terminal they cannot see from inside a headset.
-  require_confirmation_for: [autonomous, playback]
+  require_confirmation_for: [autonomous, playback, evaluate]
