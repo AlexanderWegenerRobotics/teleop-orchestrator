@@ -47,7 +47,16 @@ class ReplaySource:
         self._state = {}
         self._fext = {}
         self._grasp_confirmed = {}
+        self._ee_world = {}
         for arm in ("arm_left", "arm_right"):
+            if arm not in obs:
+                self._proprio[arm] = {
+                    "q": np.zeros((self._T, 7)), "dq": np.zeros((self._T, 7)),
+                    "O_T_EE": np.zeros((self._T, 16)), "gripper_width": np.zeros(self._T),
+                }
+                self._state[arm] = np.full(self._T, self.engaged_states[0])
+                self._fext[arm] = np.zeros((self._T, 6))
+                continue
             g = obs[arm]
             self._proprio[arm] = {
                 "q": g["q"][:], "dq": g["dq"][:], "O_T_EE": g["O_T_EE"][:],
@@ -58,6 +67,8 @@ class ReplaySource:
             # Real grasp-confirmation signal (ArmControl::updateGraspConfirmation),
             # present on episodes converted after the simulator started logging it,
             # or backfilled offline -- absent on older, non-backfilled episodes.
+            if "O_T_EE_world" in g:
+                self._ee_world[arm] = g["O_T_EE_world"][:, 12:15].astype(np.float64)
             if "grasp_confirmed" in g:
                 self._grasp_confirmed[arm] = g["grasp_confirmed"][:].astype(bool)
 
@@ -112,6 +123,7 @@ class ReplaySource:
             grasp_confirmed={arm.removeprefix("arm_"): bool(arr[t])
                               for arm, arr in self._grasp_confirmed.items()},
             candidate_world_pos=world_pos,
+            ee_world_pos={arm.removeprefix("arm_"): p[t] for arm, p in self._ee_world.items()},
         )
 
     def __len__(self) -> int:

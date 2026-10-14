@@ -224,10 +224,21 @@ def candidate_names(intent: h5py.Group) -> list[str]:
 
     Only meaningful offline (labeling, training-label alignment, playback
     overlays) — a deployed model consumes candidate indices, never names, so
-    this is never on the runtime path.
+    this is never on the runtime path. Uses the slot layout held for most of
+    the episode, not frame 0: the intention log can carry the previous
+    episode's layout for its first seconds.
     """
     name_cols = _slot_columns(intent, "slot_name_")[N_EE_SLOTS:]
-    return [_decode(intent[c][0]) for c in name_cols]
+    if not name_cols:
+        return []
+    rows = list(zip(*[[_decode(v) for v in intent[c][:]] for c in name_cols]))
+    counts: dict[tuple, int] = {}
+    for r in rows:
+        if any(r):
+            counts[r] = counts.get(r, 0) + 1
+    if not counts:
+        return [_decode(intent[c][0]) for c in name_cols]
+    return list(max(counts, key=counts.get))
 
 
 def global_features_at(arr: IntentArrays, t: int) -> np.ndarray:

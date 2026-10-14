@@ -3,7 +3,7 @@ ArmStateMsg (raw packed structs, see common.hpp) and the ReliableEnvelope
 protocol (msgpack, see network/udp_reliable.hpp). One place so ArmChannel,
 SysStateClient, and future gaze/object-info clients can't drift on formats
 verified byte-for-byte against teleop-simulator's current common.hpp
-(MsgHeader=23B, ArmCommandMsg=56B, ArmStateMsg=117B, Head*Msg=31B).
+(MsgHeader=23B, ArmCommandMsg=56B, ArmStateMsg=125B, Head*Msg=31B).
 
 These are #pragma pack(1) C structs, so a field added on the C++ side silently
 breaks BOTH directions here: inbound packets fail the size check and are
@@ -87,8 +87,11 @@ ARM_CMD_FMT = _HEADER_FMT + "3f4ffB"
 ARM_CMD_SIZE = struct.calcsize(ARM_CMD_FMT)
 
 # + position, quat, joints, tau_ext, recovering, gripper_width, grasp_state,
-# applied_cmd_sequence (the ArmCommandMsg sequence this arm actually consumed)
-ARM_STATE_FMT = _HEADER_FMT + "3f4f7f7fBfBI"
+# applied_cmd_sequence (the ArmCommandMsg sequence this arm actually consumed),
+# echo_cmd_sequence, echo_hold_us (newest command RECEIVED on this stream and
+# how long it sat on the avatar before this packet went out -- lets a sender
+# measure pure network delay as ((recv - send(echo)) - hold) / 2).
+ARM_STATE_FMT = _HEADER_FMT + "3f4f7f7fBfBIII"
 ARM_STATE_SIZE = struct.calcsize(ARM_STATE_FMT)
 
 
@@ -160,6 +163,8 @@ class ArmState:
     gripper_width: float
     grasp_state: int
     applied_cmd_sequence: int
+    echo_cmd_sequence: int
+    echo_hold_us: int
 
 
 def unpack_arm_state(data: bytes) -> Optional[ArmState]:
@@ -171,6 +176,7 @@ def unpack_arm_state(data: bytes) -> Optional[ArmState]:
         sequence=f[0], timestamp_ns=f[1], sample_time_ns=f[2], state=f[3], fault_code=f[4],
         device_id=f[5], position=f[6:9], quaternion=f[9:13], joints=f[13:20], tau_ext=f[20:27],
         recovering=bool(f[27]), gripper_width=f[28], grasp_state=f[29], applied_cmd_sequence=f[30],
+        echo_cmd_sequence=f[31], echo_hold_us=f[32],
     )
 
 
@@ -202,5 +208,5 @@ def unpack_envelope(data: bytes) -> dict:
 # import rather than at 200 Hz in a receive thread.
 assert HEADER_SIZE == 23, HEADER_SIZE
 assert ARM_CMD_SIZE == 56, ARM_CMD_SIZE
-assert ARM_STATE_SIZE == 117, ARM_STATE_SIZE
+assert ARM_STATE_SIZE == 125, ARM_STATE_SIZE
 assert HEAD_CMD_SIZE == HEAD_STATE_SIZE == 31, (HEAD_CMD_SIZE, HEAD_STATE_SIZE)

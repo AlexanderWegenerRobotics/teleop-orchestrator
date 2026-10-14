@@ -104,6 +104,7 @@ class SensorFrame:
     # individually NaN even when the array is present (a slot with no
     # matching scene.csv column, or padding beyond n_candidates).
     candidate_world_pos: Optional[np.ndarray] = None  # [n_candidates, 3] or None
+    ee_world_pos: dict[str, np.ndarray] = field(default_factory=dict)
 
     @property
     def n_candidates(self) -> int:

@@ -83,7 +83,7 @@ modules:
   policy:
     enabled: true
     checkpoint: ../teleop-policy/checkpoints/act_sorting_relpos_v3/best.pt
-    mode: autonomous         # autonomous | intervention | evaluate
+    mode: intervention         # autonomous | intervention | evaluate
     # evaluate: autonomous in N trials of fixed length, arms homed (reset_all)
     # and a new scene loaded (episode_restart) between trials. `run.py --trials N
     # --timeout S` switches to it without editing this file. Everything goes to

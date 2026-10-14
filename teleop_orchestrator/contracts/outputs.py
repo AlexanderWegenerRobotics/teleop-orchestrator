@@ -17,8 +17,18 @@ class Phase:
     GRASP = 2
     TRANSPORT = 3
     PLACE = 4
-    N_CLASSES = 5
-    NAMES = {0: "idle", 1: "approach", 2: "grasp", 3: "transport", 4: "place"}
+    INSERT = 5
+    CORRECT = 6
+    N_CLASSES = 7
+    NAMES = {0: "idle", 1: "approach", 2: "grasp", 3: "transport", 4: "place", 5: "insert", 6: "correct"}
+
+    @staticmethod
+    def pad(posterior: np.ndarray) -> np.ndarray:
+        """Zero-pads a posterior from a model with fewer phases to N_CLASSES."""
+        p = np.asarray(posterior, dtype=np.float64)
+        if p.shape[-1] >= Phase.N_CLASSES:
+            return p
+        return np.concatenate([p, np.zeros(p.shape[:-1] + (Phase.N_CLASSES - p.shape[-1],))], axis=-1)
 
 
 def _entropy(p: np.ndarray) -> float:
