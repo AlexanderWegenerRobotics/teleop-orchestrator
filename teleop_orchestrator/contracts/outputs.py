@@ -90,11 +90,17 @@ class ActionOutput:
 
 
 @dataclass
-class AssistOutput:
-    """Assistance module decision: what to surface to the operator this tick."""
+class NudgeOutput:
+    """Nudge engine decision for one tick: the cue commands issued and the proposals it held back."""
 
-    active: bool                        # whether any assistance is offered now
-    kind: str = ""                      # e.g. "target_hint", "arm_hint", "force_cue"
-    target: int = NULL_TARGET           # candidate the hint refers to, if any
-    arm: str = ""                       # "left"/"right"/"" if not arm-specific
-    payload: dict = field(default_factory=dict)
+    issued: list = field(default_factory=list)
+    suppressed: list = field(default_factory=list)
+    extras: dict = field(default_factory=dict)
+
+    @property
+    def active(self) -> bool:
+        """Whether any cue went out this tick."""
+        return len(self.issued) > 0
+
+
+AssistOutput = NudgeOutput

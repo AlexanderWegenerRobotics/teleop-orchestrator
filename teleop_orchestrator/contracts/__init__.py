@@ -9,6 +9,7 @@ from .outputs import (
     IntentOutput,
     ActionOutput,
     AssistOutput,
+    NudgeOutput,
 )
 from .features import (
     IntentArrays,
@@ -31,6 +32,7 @@ __all__ = [
     "IntentOutput",
     "ActionOutput",
     "AssistOutput",
+    "NudgeOutput",
     "IntentArrays",
     "load_intent_arrays",
     "candidate_features_at",

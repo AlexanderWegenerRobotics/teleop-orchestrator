@@ -79,6 +79,8 @@ modules:
     enabled: false
     family: hmm          # hmm | gru | transformer -- picks teleop_intent.models.<family>
     checkpoint: ../teleop-intent/checkpoints/hmm/v12.npz
+    # task_prior: ../teleop-intent/checkpoints/task_prior/fmb_v1.npz   # optional, see intent_factory.py
+    # prior_beta: 0.5
 
   policy:
     enabled: true

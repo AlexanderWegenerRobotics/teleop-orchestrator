@@ -1,0 +1,44 @@
+# Local role with the local simulator as the plant (desk setup), no twin, no intent.
+# Reflexive nudges only: the first end-to-end test of contact onset and excessive wrench.
+role: local
+
+network:
+  tick_on: tick             # tick = every avatar control tick (100 Hz); frame = every new video frame (camera rate)
+  host: 127.0.0.1
+  arm_left:  {send_port: 7011, receive_port: 8011}   # avatar's transmission_absolute ports
+  arm_right: {send_port: 7012, receive_port: 8012}
+  head:      {send_port: 7013, receive_port: 8013}
+  scene_objects: {receive_port: 7200}
+  episode_events: {receive_port: 7210}  # avatar pipeline_logger.extra_targets
+  gaze: {receive_port: 7300}            # interface local_orchestrator.port: gaze_sample and operator_state arrive here
+
+geometry:
+  head_position: [0.0, 0.0, 1.844]
+  camera_position: [0.05, 0.0, 0.035]
+  camera_name: desk_cam
+  camera_params_path: ../teleop-simulator/logs/camera_params.json
+  static_camera: true
+  goals_from: ../teleop-intent/labeling/tasks/fmb_board_1.yaml   # board slots as goal candidates; the fmb_v3 checkpoints expect them
+  n_candidates: 8
+
+logging:
+  dir: logs            # logs/<session_id>/<episode:03d>/{orchestrator.hdf5,nudge.csv}; before the first episode event: logs/<timestamp>/
+
+modules:
+  intent:
+    enabled: false
+    family: gru
+    checkpoint: ../teleop-intent/checkpoints/gru/fmb_v3_s0.pt   # needs geometry.goals_from (goal candidates)
+    task_prior: ../teleop-intent/checkpoints/task_prior/fmb_v1.npz   # p(next slot | filled slots); null/absent = perceptual model only
+    prior_beta: 0.5           # exponent on the task prior: 0 = off, 1 = full Bayesian product (offline sweep: 0.5)
+    highlight:                # development aid: disc under the predicted target in the VR overlay (interface overlay intent_highlight.enabled)
+      enabled: true
+      host: 127.0.0.1
+      port: 7500              # the interface's nudge_port
+      min_prob: 0.5
+      hz: 20
+  nudge:
+    enabled: true
+    send: true
+    state_source: local_sim     # overrides state.state_source in the nudge config
+    config: ../teleop-nudge/configs/nudge.yaml

@@ -11,6 +11,7 @@ import numpy as np
 from .contracts import SensorFrame, GLOBAL_FEATURE_NAMES
 from .contracts.features import (
     IntentArrays, load_intent_arrays, candidate_features_at, candidate_world_pos_at, global_features_at,
+    static_camera_pose, project_static, append_goal_candidates, NOT_PROJECTED,
 )
 
 ENGAGED_DEFAULT = (4,)
@@ -23,14 +24,19 @@ class ReplaySource:
     read lazily per frame (large). Candidate/global feature assembly lives in
     contracts.features, shared with the intent training loader so a model
     never sees different inputs at train time vs runtime.
+
+    `goals` (name -> world position, task-config order) appends the board's
+    goal slots as CAND_GOAL candidates after the padded object block, the
+    same way LiveSource does.
     """
 
     def __init__(self, path: str, rate_hz: Optional[float] = None,
-                 load_images: bool = True, engaged_states=ENGAGED_DEFAULT):
+                 load_images: bool = True, engaged_states=ENGAGED_DEFAULT, goals: Optional[dict] = None):
         self.path = path
         self.rate_hz = rate_hz
         self.load_images = load_images
         self.engaged_states = tuple(engaged_states)
+        self.goals = dict(goals) if goals else None
         self._f = h5py.File(path, "r")
         self._prime()
 
@@ -80,6 +86,13 @@ class ReplaySource:
         self._img_group = obs["images"] if (self.load_images and "images" in obs) else None
         self._cams = list(self._img_group.keys()) if self._img_group is not None else []
 
+        if self.goals:
+            self._goal_names = list(self.goals)
+            self._goal_pos = np.asarray([self.goals[g] for g in self._goal_names], dtype=np.float64).reshape(-1, 3)
+            cam = static_camera_pose(obs)
+            self._goal_rays = (project_static(self._goal_pos, cam) if cam is not None
+                               else np.full((len(self._goal_names), 2), NOT_PROJECTED))
+
     def _global_features(self, t: int) -> np.ndarray:
         """Assembles the scene-level (non-candidate) feature vector at timestep t:
         the shared intent global features plus per-arm gripper width and wrench,
@@ -106,6 +119,13 @@ class ReplaySource:
         """Builds the SensorFrame for timestep t."""
         features, mask, types = candidate_features_at(self._intent_arrays, t)
         world_pos = candidate_world_pos_at(self._intent_arrays, t)
+        names = list(self._intent_arrays.names[t]) if self._intent_arrays.names is not None else []
+        if self.goals:
+            ee = {side: (self._ee_world[f"arm_{side}"][t] if f"arm_{side}" in self._ee_world
+                         else self._intent_arrays.ee_pos[side][t]) for side in ("left", "right")}
+            features, mask, types, world_pos, names = append_goal_candidates(
+                features, mask, types, world_pos, names, self._goal_names, self._goal_pos, self._goal_rays,
+                ee["left"], ee["right"])
         images = {c: self._img_group[c][t] for c in self._cams} if self._img_group is not None else {}
         proprio = {arm: np.concatenate([p["q"][t], p["dq"][t], p["O_T_EE"][t]])
                    for arm, p in self._proprio.items()}
@@ -124,6 +144,7 @@ class ReplaySource:
                               for arm, arr in self._grasp_confirmed.items()},
             candidate_world_pos=world_pos,
             ee_world_pos={arm.removeprefix("arm_"): p[t] for arm, p in self._ee_world.items()},
+            candidate_names=names,
         )
 
     def __len__(self) -> int:

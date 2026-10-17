@@ -31,7 +31,9 @@ N_EE_SLOTS = 2  # ee_left, ee_right always occupy joint-slot indices 0 and 1
 # see SensorFrame's docstring: "end-effector is NOT a candidate").
 CAND_OBJECT = 0
 CAND_BIN = 1
+CAND_GOAL = 2
 CAND_UNKNOWN = -1
+NOT_PROJECTED = -1000.0  # matches intention_buffer.cpp's kNotProjected
 _RAW_TO_CAND_TYPE = {SLOT_PICK_OBJ: CAND_OBJECT, SLOT_PLACE: CAND_BIN}
 
 # Columns that are the live filter's own posterior over targets and must never
@@ -57,6 +59,11 @@ def _native_camera_dims(obs: Optional[h5py.Group]) -> tuple[float, float]:
                 if cam in images and "native_width" in images[cam].attrs:
                     return float(images[cam].attrs["native_width"]), float(images[cam].attrs["native_height"])
     return 1280.0, 960.0
+
+
+def _decode(v) -> str:
+    """Decodes an hdf5 string cell (bytes or str) to a plain str."""
+    return v.decode("utf-8") if isinstance(v, (bytes, np.bytes_)) else str(v)
 
 
 def _slot_columns(group: h5py.Group, prefix: str) -> list[str]:
@@ -91,6 +98,7 @@ class IntentArrays:
     pos: np.ndarray               # [T, n_pickplace, 3] candidate world (x,y,z); NaN where
                                    # unavailable (pre-backfill episodes, or a padded/empty slot).
                                    # Sim-privileged (scene.csv), see candidate_world_pos_at.
+    names: Optional[np.ndarray] = None   # [T, n_pickplace] per-frame slot names ("" = empty slot)
 
 
 def load_intent_arrays(intent: h5py.Group, obs: Optional[h5py.Group] = None) -> IntentArrays:
@@ -133,15 +141,15 @@ def load_intent_arrays(intent: h5py.Group, obs: Optional[h5py.Group] = None) -> 
     # N_EE_SLOTS offset and capacity trimming applies. Absent entirely on
     # older episodes -- left as NaN rather than 0.0 so a caller can't
     # mistake "no data" for "position (0,0,0)".
-    pos_x_cols = _slot_columns(intent, "slot_pos_x_")[N_EE_SLOTS:N_EE_SLOTS + n_pickplace]
-    pos_y_cols = _slot_columns(intent, "slot_pos_y_")[N_EE_SLOTS:N_EE_SLOTS + n_pickplace]
-    pos_z_cols = _slot_columns(intent, "slot_pos_z_")[N_EE_SLOTS:N_EE_SLOTS + n_pickplace]
-    n_pos = min(len(pos_x_cols), len(pos_y_cols), len(pos_z_cols))
+    # Looked up by slot number, not list position: the converter and the
+    # backfill write no slot_pos columns for the EE slots (0, 1), so slicing
+    # the sorted column list by N_EE_SLOTS shifted every position two
+    # candidates over.
     pos = np.full((T, n_pickplace, 3), np.nan, dtype=np.float64)
-    if n_pos:
-        pos[:, :n_pos, 0] = _stack(intent, pos_x_cols[:n_pos])
-        pos[:, :n_pos, 1] = _stack(intent, pos_y_cols[:n_pos])
-        pos[:, :n_pos, 2] = _stack(intent, pos_z_cols[:n_pos])
+    for j in range(n_pickplace):
+        cols = [f"slot_pos_{a}_{j + N_EE_SLOTS}" for a in "xyz"]
+        if all(c in intent for c in cols):
+            pos[:, j, :] = np.stack([intent[c][:] for c in cols], axis=1)
 
     n_slots = intent["n_slots"][:].astype(int)
     gaze = np.stack([intent["gaze_px_x"][:], intent["gaze_px_y"][:]], axis=1)
@@ -182,10 +190,14 @@ def load_intent_arrays(intent: h5py.Group, obs: Optional[h5py.Group] = None) -> 
     if "ee_belief_ee_left" in intent and "ee_belief_ee_right" in intent:
         ee_belief = np.stack([intent["ee_belief_ee_left"][:], intent["ee_belief_ee_right"][:]], axis=1)
 
+    names = np.full((T, n_pickplace), "", dtype=object)
+    for j, c in enumerate(_slot_columns(intent, "slot_name_")[N_EE_SLOTS:N_EE_SLOTS + n_pickplace]):
+        names[:, j] = [_decode(v) for v in intent[c][:]]
+
     return IntentArrays(
         n_pickplace=n_pickplace, types=types, px_u=px_u, px_v=px_v, dist=dist,
         n_slots=n_slots, gaze=gaze, gaze_valid=gaze_valid, gripper=gripper,
-        ee_pos=ee_pos, ee_belief=ee_belief, pos=pos,
+        ee_pos=ee_pos, ee_belief=ee_belief, pos=pos, names=names,
     )
 
 
@@ -211,11 +223,6 @@ def candidate_world_pos_at(arr: IntentArrays, t: int) -> np.ndarray:
     must treat NaN as "no evidence available", never as zero.
     """
     return arr.pos[t]
-
-
-def _decode(v) -> str:
-    """Decodes an hdf5 string cell (bytes or str) to a plain str."""
-    return v.decode("utf-8") if isinstance(v, (bytes, np.bytes_)) else str(v)
 
 
 def candidate_names(intent: h5py.Group) -> list[str]:
@@ -252,3 +259,50 @@ def global_features_at(arr: IntentArrays, t: int) -> np.ndarray:
     ]
     parts.append(arr.ee_belief[t] if arr.ee_belief is not None else np.zeros(2))
     return np.concatenate(parts).astype(np.float64)
+
+
+def static_camera_pose(obs: Optional[h5py.Group]) -> Optional[np.ndarray]:
+    """T_world_cam [4, 4] of the episode's static (world-fixed) camera, or None for head-camera episodes."""
+    images = obs.get("images") if obs is not None else None
+    if images is None:
+        return None
+    for cam in images:
+        if not cam.startswith("head") and "T_world_cam" in images[cam].attrs:
+            return np.asarray(images[cam].attrs["T_world_cam"], dtype=np.float64)
+    return None
+
+
+def project_static(p_world: np.ndarray, T_world_cam: np.ndarray) -> np.ndarray:
+    """World points [N, 3] -> normalized ray coords [N, 2] through a static MuJoCo camera (NOT_PROJECTED if behind).
+
+    Same chain as intention_buffer.cpp's static branch: p_CV = diag(1, -1, -1) R^T (p - c).
+    """
+    p = np.atleast_2d(np.asarray(p_world, dtype=np.float64))
+    pc = (p - T_world_cam[:3, 3]) @ T_world_cam[:3, :3]
+    x, y, z = pc[:, 0], -pc[:, 1], -pc[:, 2]
+    out = np.full((len(p), 2), NOT_PROJECTED)
+    ok = z > 0.0
+    out[ok, 0] = x[ok] / z[ok]
+    out[ok, 1] = y[ok] / z[ok]
+    return out
+
+
+def append_goal_candidates(features: np.ndarray, mask: np.ndarray, types: np.ndarray, world_pos: np.ndarray,
+                           names: list, goal_names: list, goal_pos: np.ndarray, goal_rays: np.ndarray,
+                           ee_left, ee_right) -> tuple:
+    """Appends the task's goals (board slots) after the padded object/bin block as CAND_GOAL candidates.
+
+    Goals are fixed to the board, so their position comes from the task config rather than the scene
+    stream; columns follow CANDIDATE_FEATURE_NAMES (rays from the caller's camera, EE distances from
+    the given world EE positions). Returns (features, mask, types, world_pos, names) extended by G rows.
+    """
+    g = np.asarray(goal_pos, dtype=np.float64).reshape(-1, 3)
+    d_left = np.linalg.norm(g - np.asarray(ee_left, dtype=np.float64)[None, :], axis=1)
+    d_right = np.linalg.norm(g - np.asarray(ee_right, dtype=np.float64)[None, :], axis=1)
+    gf = np.column_stack([goal_rays[:, 0], goal_rays[:, 1], d_left, d_right])
+    n = len(mask)
+    names = list(names)[:n] + [""] * max(0, n - len(names))
+    wp = world_pos if world_pos is not None else np.full((n, 3), np.nan)
+    return (np.concatenate([features, gf]), np.concatenate([mask, np.ones(len(g), dtype=bool)]),
+            np.concatenate([types, np.full(len(g), CAND_GOAL, dtype=types.dtype)]),
+            np.concatenate([wp, g]), names + list(goal_names))

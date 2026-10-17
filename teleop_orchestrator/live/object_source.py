@@ -55,6 +55,7 @@ class ObjectFrame:
     frame_id: int
     timestamp_ns: int
     slots: list
+    tick_id: int = 0
     # {"arm_left": int, "arm_right": int}, CommandAuthority per arm. The avatar
     # re-sends this every tick rather than publishing an event, so a dropped
     # datagram costs 10 ms of staleness instead of leaving the policy acting on
@@ -157,7 +158,7 @@ class SimObjectSource(ObjectSource):
             # .get, not [..]: an avatar that predates the authority field is a
             # perfectly good avatar, it just is not gating anything.
             authority = {str(k): int(v) for k, v in (msg.get("authority") or {}).items()}
-            frame = ObjectFrame(frame_id=msg["frame_id"], timestamp_ns=msg["timestamp_ns"],
+            frame = ObjectFrame(frame_id=msg["frame_id"], tick_id=int(msg.get("tick_id", 0)), timestamp_ns=msg["timestamp_ns"],
                                 slots=slots, authority=authority,
                                 state=int(msg.get("state", 255)),
                                 head_pan=float(msg.get("head_pan", 0.0)),

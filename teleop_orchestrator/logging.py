@@ -9,7 +9,9 @@ from collections import defaultdict
 import h5py
 import numpy as np
 
-from .contracts import SensorFrame, IntentOutput, ActionOutput, AssistOutput
+from .contracts import SensorFrame, IntentOutput, ActionOutput, NudgeOutput, Phase, GLOBAL_FEATURE_NAMES
+
+_GAZE_RAY = [GLOBAL_FEATURE_NAMES.index("gaze_x"), GLOBAL_FEATURE_NAMES.index("gaze_y")]
 
 
 class RunLogger:
@@ -72,6 +74,7 @@ class RunLogger:
         self._frame["frame_id"].append(frame.frame_id)
         self._frame["engaged"].append(frame.engaged)
         self._frame["gaze_valid"].append(frame.gaze_valid)
+        self._frame["gaze_ray"].append(np.asarray(frame.global_features[_GAZE_RAY], dtype=np.float64))
         self._frame["usable"].append(frame.usable)
         # Who held each arm this tick, as the avatar reported it. One series per
         # arm rather than one for the robot: the two genuinely differ during an
@@ -84,6 +87,9 @@ class RunLogger:
             self._frame[f"authority_{side}"].append(int((frame.authority or {}).get(side, 255)))
         self._frame["candidate_types"].append(frame.candidate_types)
         self._frame["candidate_mask"].append(frame.candidate_mask)
+        n = len(frame.candidate_mask)
+        names = [str(x) for x in list(frame.candidate_names or [])[:n]]
+        self._frame["candidate_names"].append(names + [""] * (n - len(names)))
         # Where the candidates actually were, not just how many there were.
         # candidate_features columns are CANDIDATE_FEATURE_NAMES
         # (px_u, px_v, dist_left, dist_right), so this answers both "was the
@@ -109,6 +115,7 @@ class RunLogger:
         with h5py.File(path, "w") as f:
             f.attrs["created"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             f.attrs["modules"] = np.array(self._modules, dtype=h5py.string_dtype())
+            f.attrs["phase_names"] = np.array([Phase.NAMES[i] for i in range(Phase.N_CLASSES)], dtype=h5py.string_dtype())
             for k, v in (meta or {}).items():
                 f.attrs[k] = v
             fg = f.create_group("frames")
@@ -121,6 +128,10 @@ class RunLogger:
                 if len(v) != n:
                     print(f"[RunLogger] skipping frames/{k}: {len(v)} of {n} ticks populated")
                     continue
+                if k == "candidate_names":
+                    fg.create_dataset(k, data=np.asarray(v, dtype=object).astype(h5py.string_dtype()),
+                                      compression="gzip")
+                    continue
                 fg.create_dataset(k, data=np.asarray(v))
             mg = f.create_group("modules")
             for path_key, seq in self._mod.items():
@@ -129,6 +140,48 @@ class RunLogger:
                 cg = f.create_group("commanded")
                 for path_key, seq in self._cmd.items():
                     cg.create_dataset(path_key, data=np.asarray(seq))
+
+
+class EpisodeLogger:
+    """RunLogger that rotates on the avatar's episode events, so every producer
+    writes into the same logs/<session_id>/<episode:03d>/ folder."""
+
+    def __init__(self, base_dir: str, meta: dict | None = None, pre_name: str | None = None):
+        self.base_dir = base_dir
+        self.meta = meta or {}
+        self._pre_name = pre_name or time.strftime("%Y%m%d_%H%M%S")
+        self._inner = RunLogger()
+        self.episode_dir: str | None = None
+
+    @property
+    def n_ticks(self) -> int:
+        return self._inner.n_ticks
+
+    def record(self, frame, outputs) -> None:
+        self._inner.record(frame, outputs)
+
+    def log_arm_state(self, side, state) -> None:
+        self._inner.log_arm_state(side, state)
+
+    def log_gripper(self, side, width, close_flag) -> None:
+        self._inner.log_gripper(side, width, close_flag)
+
+    def rotate(self, episode_dir: str) -> str:
+        """Flushes the current buffer and starts a fresh one for `episode_dir`; returns the new folder."""
+        self.flush()
+        self._inner = RunLogger()
+        self.episode_dir = os.path.join(self.base_dir, episode_dir)
+        return self.episode_dir
+
+    def flush(self) -> str | None:
+        """Saves buffered ticks (if any) to the current episode folder, or <base>/<pre_name> before the first event."""
+        if self._inner.n_ticks == 0:
+            return None
+        folder = self.episode_dir or os.path.join(self.base_dir, self._pre_name)
+        path = os.path.join(folder, "orchestrator.hdf5")
+        self._inner.save(path, meta=self.meta)
+        print(f"[run] saved {path}")
+        return path
 
 
 def _serialize(name: str, out, store: dict) -> None:
@@ -140,6 +193,14 @@ def _serialize(name: str, out, store: dict) -> None:
             store[f"{name}/{arm}/target_posterior"].append(ai.target_posterior)
             if ai.location_posterior is not None:
                 store[f"{name}/{arm}/location_posterior"].append(ai.location_posterior)
+            # Task-prior diagnostics (TaskCorrectedIntentModel): the prior over
+            # candidates, the occupancy state it was keyed by, and the base
+            # model's posterior before the prior, so a live run can be split
+            # into "prior helped / prior hurt" offline.
+            for key in ("task_prior", "task_state", "base_target_posterior"):
+                per_arm = (out.extras or {}).get(key)
+                if isinstance(per_arm, dict) and arm in per_arm:
+                    store[f"{name}/{arm}/{key}"].append(np.asarray(per_arm[arm]))
     elif isinstance(out, ActionOutput):
         for arm, pose in out.ee_pose.items():
             store[f"{name}/{arm}/ee_pose"].append(pose)
@@ -151,7 +212,7 @@ def _serialize(name: str, out, store: dict) -> None:
         for key, val in (out.extras or {}).items():
             if isinstance(val, (int, float)) and not isinstance(val, bool):
                 store[f"{name}/extras/{key}"].append(float(val))
-    elif isinstance(out, AssistOutput):
-        store[f"{name}/active"].append(float(out.active))
-        store[f"{name}/target"].append(out.target)
+    elif isinstance(out, NudgeOutput):
+        store[f"{name}/n_issued"].append(float(len(out.issued)))
+        store[f"{name}/n_suppressed"].append(float(len(out.suppressed)))
     # unknown output types are skipped; add a handler when a new one appears

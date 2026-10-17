@@ -35,8 +35,10 @@ class SensorFrame:
     timestamp_ns: int
     frame_id: int
 
-    # Per-candidate features (objects + bins; end-effector is NOT a candidate).
-    # Columns are CANDIDATE_FEATURE_NAMES, in that order.
+    # Per-candidate features (objects + bins, then task goals when configured;
+    # end-effector is NOT a candidate). Columns are CANDIDATE_FEATURE_NAMES.
+    # Goal rows (CAND_GOAL) sit after the padded object block, so object
+    # indices are unchanged by them.
     candidate_features: np.ndarray      # [n_candidates, n_candidate_features]
     candidate_mask: np.ndarray          # [n_candidates] bool, True = real candidate
     candidate_types: np.ndarray         # [n_candidates] int, semantic type per slot
@@ -105,6 +107,17 @@ class SensorFrame:
     # matching scene.csv column, or padding beyond n_candidates).
     candidate_world_pos: Optional[np.ndarray] = None  # [n_candidates, 3] or None
     ee_world_pos: dict[str, np.ndarray] = field(default_factory=dict)
+
+    # Raw ArmState per source and arm for consumers that need more than the
+    # feature vectors (the nudge engine). Keys "remote"/"twin", then
+    # "arm_left"/"arm_right"; a missing source means that channel is not open.
+    arm_states: dict[str, dict] = field(default_factory=dict)
+    # Candidate names in candidate index order ("" for padding): SceneObjectsMsg slot names live,
+    # per-frame slot names on replay, goal names for CAND_GOAL rows. The intent model reads the
+    # part type off them (type match between a held part and a goal).
+    candidate_names: list = field(default_factory=list)
+    # VR interface operator_state (clutch per hand), local role only; None when not received.
+    operator: Optional[object] = None
 
     @property
     def n_candidates(self) -> int:

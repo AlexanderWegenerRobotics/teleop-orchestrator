@@ -1,0 +1,51 @@
+# Local role: runs on the operator PC next to the VR interface and the twin.
+# Receives only. Intent and the nudge engine run here; nothing commands the robot.
+role: local
+
+network:
+  tick_on: tick             # tick = every avatar control tick (100 Hz); frame = every new video frame (camera rate)
+  host: 127.0.0.1           # avatar side: 172.23.1.1 over ZeroTier, 127.0.0.1 when the plant is the local sim
+  # Receive ports are this process's own. The avatar must publish a second ArmStateMsg
+  # copy to them (transmission_absolute.send_port), the interface keeps 8001/8002.
+  arm_left:  {send_port: 7011, receive_port: 8011}
+  arm_right: {send_port: 7012, receive_port: 8012}
+  head:      {send_port: 7013, receive_port: 8013}
+  scene_objects: {receive_port: 7200}   # avatar.scene_objects in robot_config must point at this host
+  gaze: {receive_port: 7300}            # interface local_orchestrator.port: gaze_sample and operator_state arrive here
+  episode_events: {receive_port: 7210}  # avatar pipeline_logger.extra_targets: rotates logs/<session_id>/<episode>/
+  # twin:                               # add back when the twin runs; its absolute channel must send to 8911/8912
+  #   host: 127.0.0.1
+  #   arm_left:  {send_port: 7911, receive_port: 8911}
+  #   arm_right: {send_port: 7912, receive_port: 8912}
+
+geometry:
+  head_position: [0.0, 0.0, 1.844]
+  camera_position: [0.05, 0.0, 0.035]
+  camera_name: desk_cam             # head_head_cam_left on the bimanual rig
+  camera_params_path: ../teleop-simulator/logs/camera_params.json
+  static_camera: true               # false on the bimanual rig (head camera)
+  goals_from: ../teleop-intent/labeling/tasks/fmb_board_1.yaml   # board slots as goal candidates; remove for tasks without goals
+  n_candidates: 8
+
+logging:
+  dir: logs            # logs/<session_id>/<episode:03d>/{orchestrator.hdf5,nudge.csv}; before the first episode event: logs/<timestamp>/
+
+modules:
+  intent:
+    enabled: true
+    family: gru
+    checkpoint: ../teleop-intent/checkpoints/gru/fmb_v3_s0.pt   # goal candidates + held-part pin, no gaze dropout (intent-gaze-dropout-and-pinning.md)
+    task_prior: ../teleop-intent/checkpoints/task_prior/fmb_v1.npz   # p(next slot | filled slots); null/absent = perceptual model only
+    prior_beta: 0.5           # exponent on the task prior: 0 = off, 1 = full Bayesian product (offline sweep: 0.5)
+    hz: 20                    # intent is stepped at this rate, the nudge engine every tick
+    highlight:                # development aid: disc under the predicted target in the VR overlay (interface overlay intent_highlight.enabled)
+      enabled: true
+      host: 127.0.0.1
+      port: 7500              # the interface's nudge_port
+      min_prob: 0.5
+      hz: 20
+  nudge:
+    enabled: true
+    send: true
+    state_source: local_sim     # remote on the real link
+    config: ../teleop-nudge/configs/nudge.yaml

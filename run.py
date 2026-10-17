@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from typing import Optional
 
@@ -22,19 +23,20 @@ import yaml
 
 from teleop_orchestrator.arbitrator import EVALUATE_MODE, INTERVENTION_MODE, SystemArbitrator
 from teleop_orchestrator.evaluation import EvalSession, RoutingLogger
-from teleop_orchestrator.intent_factory import build_intent_model
+from teleop_orchestrator.intent_factory import build_intent_from_config
 from teleop_orchestrator.live import wire
 from teleop_orchestrator.live.arm_channel import ArmChannel
-from teleop_orchestrator.live.camera_geometry import load_intrinsics
+from teleop_orchestrator.live.camera_geometry import CameraParams
+from teleop_orchestrator.live.episode_events import EpisodeEventReceiver
 from teleop_orchestrator.live.gaze_receiver import GazeReceiver
 from teleop_orchestrator.live.head_channel import HeadChannel
 from teleop_orchestrator.live.live_source import LiveSource
 from teleop_orchestrator.live.object_source import SimObjectSource
 from teleop_orchestrator.live.shared_frame_reader import SharedFrameReader
 from teleop_orchestrator.live.sys_state_client import SysStateClient
-from teleop_orchestrator.logging import RunLogger
+from teleop_orchestrator.logging import EpisodeLogger, RunLogger
 from teleop_orchestrator.operator_console import OperatorConsole
-from teleop_orchestrator.orchestrator import Orchestrator
+from teleop_orchestrator.orchestrator import Orchestrator, RateLimited, Wire
 from teleop_orchestrator.playback_module import PlaybackModule
 from teleop_orchestrator.policy_module import PolicyModule
 
@@ -43,6 +45,25 @@ def load_config(path: str) -> dict:
     """Loads and returns system.yaml as a plain dict."""
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def candidate_geometry(geo: dict) -> dict:
+    """LiveSource kwargs from the geometry block: camera_params.json entry, static_camera and task goals (goals_from)."""
+    static = bool(geo.get("static_camera"))
+    if geo.get("gaze_image_size"):
+        print("[run] geometry.gaze_image_size is ignored: the gaze scale comes from the texture size the interface reports")
+    out = {"static_camera": static, "camera": None}
+    try:
+        out["camera"] = CameraParams(geo["camera_params_path"], geo["camera_name"], stereo_stream=not static)
+    except (OSError, KeyError, ValueError) as e:
+        if static:
+            raise
+        print(f"[run] WARNING: gaze normalization unavailable ({e}); gaze_valid will stay False this session.")
+    if geo.get("goals_from"):
+        with open(geo["goals_from"]) as f:
+            goals = (yaml.safe_load(f) or {}).get("goals") or {}
+        out["goals"] = {name: g["pos"] for name, g in goals.items()}
+    return out
 
 
 def build_live_channels(net: dict, host: str):
@@ -100,7 +121,7 @@ def build_modules(cfg: dict, mode: str, arm_left: ArmChannel, arm_right: ArmChan
     modules = {}
     mcfg = cfg["modules"]
     if mcfg["intent"]["enabled"]:
-        modules["intent"] = build_intent_model(mcfg["intent"]["family"], mcfg["intent"]["checkpoint"])
+        modules["intent"] = build_intent_from_config(mcfg["intent"])
     if mode == "playback":
         pbcfg = mcfg["playback"]
         modules["playback"] = PlaybackModule(pbcfg["episode"], arm_left, arm_right,
@@ -396,10 +417,110 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+def build_local_channels(net: dict):
+    """Receive-only channels for the local role: avatar arm state, optional twin arm state, gaze, scene objects."""
+    host = net["host"]
+    arms = {}
+    for side, dev in (("arm_left", wire.DeviceId.LEFT_ARM), ("arm_right", wire.DeviceId.RIGHT_ARM)):
+        arms[side] = ArmChannel(side, dev, host, net[side]["send_port"], net[side]["receive_port"])
+    twin = {}
+    if net.get("twin"):
+        for side, dev in (("arm_left", wire.DeviceId.LEFT_ARM), ("arm_right", wire.DeviceId.RIGHT_ARM)):
+            twin[side] = ArmChannel(f"twin_{side}", dev, net["twin"]["host"],
+                                    net["twin"][side]["send_port"], net["twin"][side]["receive_port"])
+    gaze = GazeReceiver(receive_port=net["gaze"]["receive_port"], max_staleness_s=0.3)
+    objects = SimObjectSource(receive_port=net["scene_objects"]["receive_port"])
+    head = HeadChannel(host, net["head"]["send_port"], net["head"]["receive_port"])
+    episodes = EpisodeEventReceiver(net["episode_events"]["receive_port"]) if net.get("episode_events") else None
+    channels = [c for c in (*arms.values(), *twin.values(), gaze, objects, head, episodes) if c is not None]
+    for c in channels:
+        c.start()
+    return arms, twin, gaze, objects, head, episodes, channels
+
+
+def main_local(cfg: dict, config_path: str) -> None:
+    """Local role: intent and nudge engine on the operator PC. Never commands the robot."""
+    from teleop_orchestrator.intent_highlight import IntentHighlightSender
+    from teleop_orchestrator.nudge_module import NudgeModule, assemble
+
+    net, geo = cfg["network"], cfg["geometry"]
+    arms, twin, gaze, objects, head, episodes, channels = build_local_channels(net)
+    live_source = LiveSource(
+        object_source=objects, arm_left=arms["arm_left"], arm_right=arms["arm_right"], head=head, gaze=gaze,
+        cameras={}, head_position=tuple(geo["head_position"]), camera_position=tuple(geo["camera_position"]),
+        n_candidates=geo["n_candidates"],
+        twin_left=twin.get("arm_left"), twin_right=twin.get("arm_right"),
+        tick_on=net.get("tick_on", "tick"), wait_forever=True, **candidate_geometry(geo),
+    )
+    mcfg = cfg["modules"]
+    modules, wiring = {}, {}
+    if mcfg["intent"]["enabled"]:
+        modules["intent"] = RateLimited(build_intent_from_config(mcfg["intent"]),
+                                        hz=float(mcfg["intent"].get("hz", 20.0)))
+    log_dir = cfg.get("logging", {}).get("dir", "logs")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    if mcfg.get("nudge", {}).get("enabled"):
+        ncfg = mcfg["nudge"]
+        modules["nudge"] = NudgeModule(ncfg["config"], log_path=f"{log_dir}/{stamp}/nudge.csv", send=ncfg.get("send", True),
+                                       state_source=ncfg.get("state_source"))
+        wiring["nudge"] = Wire(depends_on=["intent"] if "intent" in modules else [], assemble=assemble)
+    highlight = None
+    hcfg = mcfg["intent"].get("highlight") or {}
+    if "intent" in modules and hcfg.get("enabled"):
+        highlight = IntentHighlightSender(hcfg.get("host", "127.0.0.1"), hcfg.get("port", 7500),
+                                          min_prob=hcfg.get("min_prob", 0.5), hz=hcfg.get("hz", 20.0))
+
+    logger = EpisodeLogger(log_dir, meta={"role": "local", "config_path": config_path}, pre_name=stamp)
+
+    def on_episode(ev) -> None:
+        """Rotates every local log into logs/<session_id>/<episode:03d>/ and resets the modules."""
+        if ev.type != "episode_start":
+            return
+        folder = logger.rotate(ev.episode_dir)
+        if "nudge" in modules:
+            modules["nudge"].rotate_log(os.path.join(folder, "nudge.csv"))
+        for m in modules.values():
+            m.reset()
+        print(f"[run] episode {ev.episode_index} of session {ev.session_id} -> {folder}")
+
+    def on_tick(frame, outputs) -> None:
+        if highlight is not None and outputs.get("intent") is not None:
+            highlight.send(frame, outputs["intent"])
+        if episodes is not None:
+            ev = episodes.pop()
+            while ev is not None:
+                on_episode(ev)
+                ev = episodes.pop()
+
+    print(f"[run] role: local  modules: {list(modules)}  highlight: {highlight is not None}  "
+          f"episode events: {'on' if episodes else 'off'}")
+    stop = [False]
+    console = threading.Thread(target=lambda: (input(), stop.__setitem__(0, True)), daemon=True)
+    console.start()
+    print("[run] press Enter to stop")
+    try:
+        Orchestrator(live_source, modules, wiring).run(logger=logger, on_tick=on_tick, should_stop=lambda: stop[0])
+        if logger.n_ticks == 0 and logger.episode_dir is None:
+            print(f"[run] WARNING: no frames arrived on scene_objects port {net['scene_objects']['receive_port']}")
+        logger.flush()
+    except KeyboardInterrupt:
+        print("\n[run] interrupted")
+    finally:
+        if "nudge" in modules:
+            modules["nudge"].close()
+        if highlight is not None:
+            highlight.close()
+        for c in channels:
+            c.stop()
+
+
 def main(args=None) -> None:
     args = args if args is not None else parse_args([])
     config_path = args.config
     cfg = load_config(config_path)
+    if cfg.get("role", "remote") == "local":
+        main_local(cfg, config_path)
+        return
     if args.trials is not None or args.timeout is not None:
         cfg["modules"]["policy"]["mode"] = EVALUATE_MODE
     net, geo = cfg["network"], cfg["geometry"]
@@ -415,16 +536,10 @@ def main(args=None) -> None:
         for c in cameras.values():
             c.close()
 
-    gaze_intrinsics = None
-    try:
-        gaze_intrinsics = load_intrinsics(geo["camera_params_path"], geo["camera_name"])
-    except (OSError, KeyError) as e:
-        print(f"[run] WARNING: gaze normalization unavailable ({e}); gaze_valid will stay False this session.")
-
     live_source = LiveSource(
         object_source=objects, arm_left=arm_left, arm_right=arm_right, head=head, gaze=gaze,
         cameras=cameras, head_position=tuple(geo["head_position"]), camera_position=tuple(geo["camera_position"]),
-        gaze_intrinsics=gaze_intrinsics, n_candidates=geo["n_candidates"],
+        n_candidates=geo["n_candidates"], **candidate_geometry(geo),
     )
 
     mode = resolve_mode(cfg)

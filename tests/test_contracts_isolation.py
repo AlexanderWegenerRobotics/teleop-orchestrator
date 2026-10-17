@@ -24,5 +24,5 @@ def test_public_surface_imports():
     """The advertised public types are importable from the package root."""
     from teleop_orchestrator.contracts import (  # noqa: F401
         SensorFrame, Module, SensorModule,
-        IntentOutput, ActionOutput, AssistOutput, ArmIntent, Phase, NULL_TARGET,
+        IntentOutput, ActionOutput, AssistOutput, NudgeOutput, ArmIntent, Phase, NULL_TARGET,
     )

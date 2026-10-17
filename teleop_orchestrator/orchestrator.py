@@ -21,6 +21,32 @@ class Wire:
     assemble: Callable[[SensorFrame, dict[str, Any]], Any]
 
 
+class RateLimited(Module):
+    """Steps the wrapped module at most every `period_s` and returns its last output in between."""
+
+    def __init__(self, inner: Module, hz: float):
+        self.inner = inner
+        self.period_ns = int(1e9 / hz)
+        self._last_t = None
+        self._last_out = None
+
+    def reset(self) -> None:
+        self.inner.reset()
+        self._last_t = None
+        self._last_out = None
+
+    def step(self, x):
+        t = x.timestamp_ns if isinstance(x, SensorFrame) else x[0].timestamp_ns
+        if self._last_t is None or t - self._last_t >= self.period_ns:
+            self._last_out = self.inner.step(x)
+            self._last_t = t
+        return self._last_out
+
+    @property
+    def name(self) -> str:
+        return self.inner.name
+
+
 class Orchestrator:
     """Runs registered modules over a stream of SensorFrames, one tick at a time.
 
@@ -43,7 +69,7 @@ class Orchestrator:
             missing = [d for d in wire.depends_on if d not in registered]
             if missing:
                 raise ValueError(f"{name}'s wiring depends on unregistered module(s): {missing}")
-            if registered.index(name) < max(registered.index(d) for d in wire.depends_on):
+            if wire.depends_on and registered.index(name) < max(registered.index(d) for d in wire.depends_on):
                 raise ValueError(f"{name} must be registered after its dependencies {wire.depends_on}")
 
     def run(self, logger: RunLogger | None = None,

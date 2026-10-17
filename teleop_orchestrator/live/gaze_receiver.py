@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from . import wire
+from .operator_state import OperatorState
 
 
 @dataclass
@@ -29,6 +30,8 @@ class GazeSample:
     gaze_px_y: float
     timestamp_ns: int          # operator-side capture time (already latency-compensated upstream)
     timestamp_arrival_ns: int  # orchestrator-side receive time
+    image_w: int = 0           # interface video texture size the pixels refer to; 0 from builds that predate it
+    image_h: int = 0
 
 
 class GazeReceiver:
@@ -47,6 +50,7 @@ class GazeReceiver:
 
         self._buffer: "OrderedDict[int, GazeSample]" = OrderedDict()
         self._latest: Optional[GazeSample] = None
+        self._operator: Optional[OperatorState] = None
         self._lock = threading.Lock()
         self._running = False
         self._thread: Optional[threading.Thread] = None
@@ -87,6 +91,14 @@ class GazeReceiver:
         age_s = (time.time_ns() - sample.timestamp_arrival_ns) / 1e9
         return sample if age_s <= self.max_staleness_s else None
 
+    def operator(self) -> Optional[OperatorState]:
+        """Latest operator_state from the interface (same port), or None when stale or never received."""
+        with self._lock:
+            s = self._operator
+        if s is None or (time.time_ns() - s.arrival_ns) / 1e9 > self.max_staleness_s:
+            return None
+        return s
+
     def _recv_loop(self) -> None:
         while self._running:
             try:
@@ -99,15 +111,23 @@ class GazeReceiver:
                 envelope = wire.unpack_envelope(data)
             except Exception:
                 continue
+            payload = envelope.get("payload", {})
+            if envelope.get("msg_type") == "operator_state":
+                s = OperatorState(bool(payload.get("clutch_left", 1)), bool(payload.get("clutch_right", 1)),
+                                  bool(payload.get("engaged", 0)), int(payload.get("timestamp_ns", 0)), time.time_ns())
+                with self._lock:
+                    self._operator = s
+                continue
             if envelope.get("msg_type") != "gaze_sample":
                 continue
-            payload = envelope.get("payload", {})
             sample = GazeSample(
                 frame_id=payload.get("frame_id", 0),
                 gaze_px_x=payload.get("gaze_px_x", 0.0),
                 gaze_px_y=payload.get("gaze_px_y", 0.0),
                 timestamp_ns=payload.get("timestamp_ns", 0),
                 timestamp_arrival_ns=time.time_ns(),
+                image_w=int(payload.get("image_w", 0) or 0),
+                image_h=int(payload.get("image_h", 0) or 0),
             )
             with self._lock:
                 self._buffer[sample.frame_id] = sample
