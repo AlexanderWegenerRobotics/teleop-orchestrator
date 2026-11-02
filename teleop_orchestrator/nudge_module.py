@@ -11,6 +11,7 @@ from teleop_nudge import build_engine
 from teleop_nudge.contracts import Arm
 
 from .contracts import GLOBAL_FEATURE_NAMES, IntentOutput, Module, NudgeOutput, SensorFrame
+from .contracts.features import CAND_GOAL, CAND_OBJECT
 from .live import wire
 from .live.object_source import AUTHORITY_HUMAN, AUTHORITY_UNSET
 
@@ -28,7 +29,9 @@ class NudgeModule(Module):
 
     def __init__(self, nudge_cfg, log_path: str | None = None, send: bool = True, state_source: str | None = None):
         if not isinstance(nudge_cfg, dict):
-            nudge_cfg = yaml.safe_load(Path(nudge_cfg).read_text())
+            path = Path(nudge_cfg)
+            nudge_cfg = yaml.safe_load(path.read_text())
+            nudge_cfg.setdefault("_config_dir", str(path.parent))
         if state_source:
             nudge_cfg = {**nudge_cfg, "state": {**nudge_cfg.get("state", {}), "state_source": state_source}}
         self.engine = build_engine(nudge_cfg, log_path=log_path, send=send)
@@ -59,12 +62,31 @@ class NudgeModule(Module):
                 st.set_active(side, frame.engaged and auth in (AUTHORITY_HUMAN, AUTHORITY_UNSET))
             if intent is not None:
                 ai = intent.arm(side)
-                st.push_intent(side, ai.top_phase(), ai.phase_posterior, ai.top_target(), ai.target_entropy())
+                i = ai.top_target()
+                name, kind, prob = self._target_info(frame, ai, i)
+                st.push_intent(side, ai.top_phase(), ai.phase_posterior, i, ai.target_entropy(),
+                               target_name=name, target_kind=kind, target_prob=prob)
+            if side in frame.grasp_confirmed:
+                st.push(f"grasp_held_{side}", bool(frame.grasp_confirmed[side]), t_w, "remote")
+        if frame.object_poses:
+            st.push("objects", dict(frame.object_poses), frame.timestamp_ns, "remote")
         st.set_engaged(frame.engaged)
         snap, proposals, decision = self.engine.step(frame.timestamp_ns)
         return NudgeOutput(issued=[c.to_wire() for c in decision.issued],
                            suppressed=[(p.nudge, reason) for p, reason in decision.suppressed],
                            extras={"n_proposals": len(proposals), "state_source": snap.state_source})
+
+    @staticmethod
+    def _target_info(frame: SensorFrame, ai, i: int) -> tuple[str, str, float]:
+        """Name, kind ("object" | "goal" | "") and probability of candidate i."""
+        post = np.asarray(ai.target_posterior, dtype=float)
+        if i < 0 or i >= post.size or i >= len(frame.candidate_mask) or not frame.candidate_mask[i]:
+            return "", "", 0.0
+        names = frame.candidate_names or []
+        name = str(names[i]) if i < len(names) else ""
+        t = int(frame.candidate_types[i]) if i < len(frame.candidate_types) else -1
+        kind = "goal" if t == CAND_GOAL else ("object" if t == CAND_OBJECT else "")
+        return name, kind, float(post[i])
 
     def rotate_log(self, path) -> None:
         self.engine.rotate_log(path)

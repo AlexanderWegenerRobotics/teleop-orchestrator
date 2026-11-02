@@ -34,10 +34,10 @@ modules:
   intent:
     enabled: true
     family: gru
-    checkpoint: ../teleop-intent/checkpoints/gru/fmb_v3_s0.pt   # goal candidates + held-part pin, no gaze dropout (intent-gaze-dropout-and-pinning.md)
+    checkpoint: ../teleop-intent/checkpoints/gru/fmb_v4mg_s0.pt   # per-candidate memory + approach/grasp glance augmentation (intent-gaze-dominance-020.md); previous: fmb_v3_s0.pt
     task_prior: ../teleop-intent/checkpoints/task_prior/fmb_v1.npz   # p(next slot | filled slots); null/absent = perceptual model only
     prior_beta: 0.5           # exponent on the task prior: 0 = off, 1 = full Bayesian product (offline sweep: 0.5)
-    hz: 20                    # intent is stepped at this rate, the nudge engine every tick
+    hz: 30                    # intent is stepped at this rate (training grid is 30 Hz), the nudge engine every tick
     highlight:                # development aid: disc under the predicted target in the VR overlay (interface overlay intent_highlight.enabled)
       enabled: true
       host: 127.0.0.1

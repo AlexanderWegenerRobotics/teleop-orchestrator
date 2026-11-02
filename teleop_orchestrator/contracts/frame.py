@@ -118,6 +118,9 @@ class SensorFrame:
     candidate_names: list = field(default_factory=list)
     # VR interface operator_state (clutch per hand), local role only; None when not received.
     operator: Optional[object] = None
+    # Every scene object's body pose by name, (position (x, y, z), quaternion (w, x, y, z)), world frame.
+    # Live only (SceneObjectsMsg); empty on replay. Not truncated to n_candidates.
+    object_poses: dict = field(default_factory=dict)
 
     @property
     def n_candidates(self) -> int:

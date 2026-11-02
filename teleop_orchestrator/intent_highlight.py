@@ -28,8 +28,12 @@ class IntentHighlightSender:
             return
         self._last = now
         names = frame.candidate_names
+        ee = frame.ee_world_pos or {}
+        live = {s for s, p in ee.items() if np.linalg.norm(p) > 1e-6} if ee else {"left", "right"}
         targets = []
         for side in ("left", "right"):
+            if side not in live:
+                continue
             post = np.asarray(intent.arm(side).target_posterior, dtype=float)
             if post.size == 0:
                 continue

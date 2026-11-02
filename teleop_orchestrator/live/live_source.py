@@ -46,7 +46,7 @@ from typing import Iterator, Optional
 import numpy as np
 
 from teleop_orchestrator.contracts import CANDIDATE_FEATURE_NAMES, GLOBAL_FEATURE_NAMES, SensorFrame
-from teleop_orchestrator.contracts.features import (CAND_UNKNOWN, NOT_PROJECTED, append_goal_candidates,
+from teleop_orchestrator.contracts.features import (CAND_OBJECT, CAND_UNKNOWN, NOT_PROJECTED, append_goal_candidates,
                                                     project_static)
 
 from . import wire
@@ -275,6 +275,8 @@ class LiveSource:
                 arm_states=arm_states,
                 candidate_names=cand_names,
                 operator=self._gaze.operator(),
+                object_poses={s.name: (tuple(s.position), tuple(s.quaternion))
+                              for s in obj_frame.slots if s.type == CAND_OBJECT},
                 ee_world_pos={side: np.asarray(st.position, dtype=float)
                               for side, st in (('left', left), ('right', right)) if st is not None},
             )

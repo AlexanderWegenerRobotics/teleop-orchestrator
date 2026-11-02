@@ -456,7 +456,7 @@ def main_local(cfg: dict, config_path: str) -> None:
     modules, wiring = {}, {}
     if mcfg["intent"]["enabled"]:
         modules["intent"] = RateLimited(build_intent_from_config(mcfg["intent"]),
-                                        hz=float(mcfg["intent"].get("hz", 20.0)))
+                                        hz=float(mcfg["intent"].get("hz", 30.0)))
     log_dir = cfg.get("logging", {}).get("dir", "logs")
     stamp = time.strftime("%Y%m%d_%H%M%S")
     if mcfg.get("nudge", {}).get("enabled"):

@@ -27,19 +27,20 @@ class RateLimited(Module):
     def __init__(self, inner: Module, hz: float):
         self.inner = inner
         self.period_ns = int(1e9 / hz)
-        self._last_t = None
+        self._due = None
         self._last_out = None
 
     def reset(self) -> None:
         self.inner.reset()
-        self._last_t = None
+        self._due = None
         self._last_out = None
 
     def step(self, x):
+        """Steps on a fixed schedule, so the mean rate is hz even when the tick period does not divide it."""
         t = x.timestamp_ns if isinstance(x, SensorFrame) else x[0].timestamp_ns
-        if self._last_t is None or t - self._last_t >= self.period_ns:
+        if self._due is None or t >= self._due:
             self._last_out = self.inner.step(x)
-            self._last_t = t
+            self._due = t + self.period_ns if self._due is None or t - self._due >= self.period_ns else self._due + self.period_ns
         return self._last_out
 
     @property
